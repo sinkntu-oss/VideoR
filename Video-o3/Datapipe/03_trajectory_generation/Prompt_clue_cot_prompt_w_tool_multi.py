@@ -49,3 +49,61 @@ The "grounding" field must strictly match the timestamps from the provided "clue
 The "answer" field must be the content of the correct option.
 Input JSON:
 """
+# ============ 中文翻译 ============
+# 你是一位智能视频分析助手。
+# 你的任务是基于所提供的真实视觉线索，为视频问题生成结构化的"思维链"（CoT）解释。
+#
+# 我将提供给你一个 JSON 对象，其中包含：
+# 1. "question"：需要回答的问题。
+# 2. "options"：多项选择选项。
+# 3. "answer"：正确答案。
+# 4. "clues"：一系列视觉线索，每条线索包含 "timestamp"（开始、结束时间）和 "text"（描述）。
+#
+# 你的工作是将样本改写为工具定位式（tool-grounding-style）的多轮推理格式：你需要根据所提供的信息，
+# 生成一套从问题出发，逐步定位线索、观察线索，最终得出答案的思维过程。
+#  - 提示：时间片段（"grounding"）是工具调用。一次 "grounding" 步骤会选择一个时间区间进行仔细检视。
+#
+# 你需要根据所提供的信息，生成一套从问题出发，逐步定位线索、观察线索，最终得出答案的思维过程。
+#
+# 具体来说，你需要生成两种形式的思维过程：
+# [THINKING_PROCESS_1_INSTRUCTION]：分析上下文并描述定位下一处证据的过程：
+#  - 根据当前是第一步还是后续步骤来进行推进：
+#     1. 如果是第一步：首先分析问题，确定需要找到哪些初始线索。
+#     2. 如果是后续步骤：详细描述在上一步骤定位到的时间戳处的视觉内容。
+#  - 接下来，根据视觉信息分析视频内容，评估下一条线索可能存在的位置。
+#  - 最后，确定需要进一步调查的下一条线索的范围。
+#  - 请注意：在此过程中，避免提及"根据给定线索"之类的表述。你应该通过自己的推理推导出正确的线索，而非直接读取已提供的线索。
+#
+# [THINKING_PROCESS_2_INSTRUCTION]：汇总发现并确定答案：
+#  - 详细描述最后一个定位时间戳处的视觉内容。
+#  - 明确说明目前找到的线索已足以回答该问题。汇总前面各步骤中定位和观察到的所有线索，
+#    并解释这些视觉证据如何直接导出正确答案。
+#
+# 以下列 JSON 格式输出推理过程：
+# [
+#   {
+#     "think": "按照 [THINKING_PROCESS_1_INSTRUCTION] 生成的思维过程：你应先简要分析问题以确定要查找的线索，
+#               然后分析该线索可能在视频中的位置，最后确定需要仔细观察的线索范围。",
+#     "grounding": ["start_time_1", "end_time_1"]
+#   },
+#   {
+#     "think": "按照 [THINKING_PROCESS_1_INSTRUCTION] 生成的思维过程：你应首先详细描述在上一步骤 start_time_1 到
+#               end_time_1 中发现的与问题强相关的视觉内容（可参考给定线索 "timestamp" ["start_time_1", "end_time_1"]
+#               对应的 "text" 项），然后分析第二条线索可能在视频中的位置，最后确定下一条需要仔细观察的线索范围。",
+#     "grounding": ["start_time_2", "end_time_2"]
+#   },
+#   // 如需多个片段，可添加更多 "think" + "grounding" 字典
+#   {
+#     "think": "按照 [THINKING_PROCESS_2_INSTRUCTION] 生成的思维过程：你应首先详细描述在上一步骤 start_time_n 到
+#               end_time_n 中发现的与问题强相关的视觉内容（可参考给定线索 "timestamp" ["start_time_n", "end_time_n"]
+#               对应的 "text" 项），然后汇总目前发现的所有线索，最后根据这些线索推理得出答案。",
+#     "answer": "正确答案的大写字母选项。"
+#   }
+# ]
+#
+# 对思维过程内容的约束：某个给定 "timestamp" 对应的 "text" 内容，不得在相关联的 "grounding" 字段之前出现。
+# 线索 "timestamp" 对应的 "text" 中的相关内容，必须在该 grounding 之后的 "think" 步骤中详细描述。
+# "grounding" 字段必须与所提供的 "clues" 中的时间戳严格匹配。
+# "answer" 字段必须是正确选项的内容。
+# 输入 JSON：
+# =================================

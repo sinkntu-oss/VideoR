@@ -44,3 +44,51 @@ The "grounding" field must strictly match the timestamps from the provided "solu
 The "answer" field must be the correct option.
 Input JSON:
 """
+# ============ 中文翻译 ============
+# 你是一位智能视频分析助手。
+# 你的任务是基于所提供的真实视觉线索，为视频问题生成结构化的"思维链"（CoT）解释。
+#
+# 我将提供给你一个 JSON 对象，其中包含：
+# 1. "question"：需要回答的问题。
+# 2. "options"：多项选择选项。
+# 3. "solution"：一系列推理步骤。每个步骤包含 "grounding"（时间戳）、"think"（推理过程）
+#    以及 "previous_grounding_clue_for_reference"（对上一步骤定位内容的描述，从第二步起提供）。
+#    最后一步包含 "answer"（答案）。
+#
+# 你需要根据所提供的信息，生成一套从问题出发，逐步定位线索、观察线索，最终得出答案的思维过程。
+#
+# 具体来说，你需要生成两种形式的思维过程：
+# [THINKING_PROCESS_1_INSTRUCTION]：分析上下文并描述定位下一处证据的过程：
+#  - 根据当前是第一步还是后续步骤来进行推进：
+#     1. 如果是第一步：首先分析问题，确定需要找到哪些初始线索。
+#     2. 如果是后续步骤：详细描述在上一步骤定位到的时间戳处的视觉内容。
+#  - 接下来，根据视觉信息分析视频内容，评估下一条线索可能存在的位置。
+#  - 最后，确定需要进一步调查的下一条线索的范围。
+#  - 请注意：在此过程中，避免提及"根据给定线索"之类的表述。你应该通过自己的推理推导出正确的线索，而非直接读取已提供的线索。
+#
+# [THINKING_PROCESS_2_INSTRUCTION]：汇总发现并确定答案：
+#  - 详细描述最后一个定位时间戳处的视觉内容。
+#  - 明确说明目前找到的线索已足以回答该问题。汇总前面各步骤中定位和观察到的所有线索，
+#    并解释这些视觉证据如何直接导出正确答案。
+#
+# 以下列 JSON 格式输出推理过程：
+# [
+#   {
+#     "think": "按照 [THINKING_PROCESS_1_INSTRUCTION] 生成的思维过程",
+#     "grounding": ["start_time_1", "end_time_1"]
+#   },
+#   {
+#     "think": "按照 [THINKING_PROCESS_1_INSTRUCTION] 生成的思维过程",
+#     "grounding": ["start_time_2", "end_time_2"]
+#   },
+#   // 如需多个片段，可添加更多 "think" + "grounding" 字典
+#   {
+#     "think": "按照 [THINKING_PROCESS_2_INSTRUCTION] 生成的思维过程",
+#     "answer": "正确答案的大写字母选项。"
+#   }
+# ]
+#
+# "grounding" 字段必须与所提供的 "solution" 中的时间戳严格匹配。
+# "answer" 字段必须是正确选项。
+# 输入 JSON：
+# =================================
