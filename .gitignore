@@ -5,5 +5,14 @@ logs/
 output/
 cache/
 sft_llava-video_youtube_qa_mc_2_3_m_clue_multi_w_tool_diff_2790.json
-dataset/
-saves/
+benchmarks/
+# 评测的时候有agent_runs
+agent*
+# 数据软连接进来的
+VideoTemp-o3/eval/videomme/data/
+VideoTemp-o3/sft/data
+VideoTemp-o3/rl/data
+VideoTemp-o3/sft_videos
+VideoTemp-o3/rl_videos
+# 存测评结果
+result
