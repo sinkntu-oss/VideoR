@@ -4,15 +4,14 @@
     "formatting": "sharegpt",
     "columns": {
       "messages": "messages",
-      "videos": "videos",
-      "system": "system",
-      "id": "id"
+      "videos": "videos"
     },
     "tags": {
       "role_tag": "role",
       "content_tag": "content",
       "user_tag": "user",
-      "assistant_tag": "assistant"
+      "assistant_tag": "assistant",
+      "system_tag": "system"
     }
   },
   "sft_data_stage2": {
@@ -20,15 +19,14 @@
     "formatting": "sharegpt",
     "columns": {
       "messages": "messages",
-      "videos": "videos",
-      "system": "system",
-      "id": "id"
+      "videos": "videos"
     },
     "tags": {
       "role_tag": "role",
       "content_tag": "content",
       "user_tag": "user",
-      "assistant_tag": "assistant"
+      "assistant_tag": "assistant",
+      "system_tag": "system"
     }
   }
 }

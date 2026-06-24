@@ -1,0 +1,93 @@
+============================================================
+  Video-o3 SFT 环境安装指南
+============================================================
+
+环境名称: sft_video_o3
+Python: 3.11
+基于: LLaMA-Factory
+
+------------------------------------------------------------
+1. 创建 conda 环境
+------------------------------------------------------------
+
+conda create -n sft_video_o3 python=3.11 -y
+conda activate sft_video_o3
+
+注意: 如果 conda 源报 403 错误，需要修改 ~/.condarc:
+
+    channels:
+      - conda-forge
+    channel_priority: strict
+    default_channels: []
+
+------------------------------------------------------------
+2. 安装 SFT 项目（含 torch 和 metrics）
+------------------------------------------------------------
+
+cd /mnt/tidal-alsh01/dataset/eam_ds/VideoR/Video-o3/SFT
+pip install -e ".[torch,metrics]" --no-build-isolation
+
+⚠️ 问题: pip 默认安装了 PyTorch 2.12.1+cu130，要求 CUDA 13.0 驱动，
+   但机器 NVIDIA 驱动 570.148.08 只支持 CUDA 12.8，导致 GPU 不可用。
+
+✅ 解决: 降级 PyTorch 到 cu124 版本:
+
+pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124
+
+------------------------------------------------------------
+3. 安装 DeepSpeed
+------------------------------------------------------------
+
+pip install deepspeed
+
+------------------------------------------------------------
+4. 安装 liger-kernel（Stage2 需要）
+------------------------------------------------------------
+
+pip install liger-kernel
+
+Stage2 配置 (video_o3_sft_stage2.yaml) 启用了 enable_liger_kernel: True
+
+------------------------------------------------------------
+5. flash-attn（可选，未安装）
+------------------------------------------------------------
+
+- Stage1: 配置中注释掉了 flash_attn: fa2（可选）
+- Stage2: 明确不支持 flash-attn（4d mask 不兼容）
+- 如需安装: pip install flash-attn --no-build-isolation（需从源码编译）
+- 项目要求版本范围: >=2.5.6, <=2.7.2
+- 不装也能正常训练，默认使用 SDPA attention
+
+------------------------------------------------------------
+最终环境验证
+------------------------------------------------------------
+
+$ llamafactory-cli version
+
+组件                版本
+-----------         -----------
+Python              3.11.15
+PyTorch             2.6.0+cu124
+CUDA                12.4 (可用)
+GPU                 NVIDIA L20Y (79.2 GB), bf16 支持
+LLaMA-Factory       0.9.4.dev0
+transformers        4.57.1
+datasets            4.0.0
+accelerate          1.11.0
+peft                0.17.1
+trl                 0.9.6
+deepspeed           0.19.2
+liger-kernel        0.8.0
+
+------------------------------------------------------------
+开始训练
+------------------------------------------------------------
+
+conda activate sft_video_o3
+cd /mnt/tidal-alsh01/dataset/eam_ds/VideoR/Video-o3/SFT
+
+# Stage-1:
+llamafactory-cli train examples/video_o3_sft_stage1.yaml
+
+# Stage-2 (基于 Stage-1 的 checkpoint):
+llamafactory-cli train examples/video_o3_sft_stage2.yaml
