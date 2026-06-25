@@ -13,7 +13,7 @@
 #   bash scripts/prepare_event_data.sh
 #
 # 可配置的环境变量:
-#   CLIP_MODEL    - CLIP 模型路径 (默认: openai/clip-vit-base-patch16)
+#   CLIP_MODEL    - CLIP 模型路径 (默认: /mnt/tidal-alsh01/dataset/redone/checkpoints/opensource/siglip2-so400m-patch16-512)
 #   SAMPLE_FPS    - 帧采样率 Hz  (默认: 2.0)
 #   KERNEL_SIZE   - 卷积核大小    (默认: 5)
 #   BATCH_SIZE    - CLIP 推理批大小 (默认: 64)
@@ -25,7 +25,7 @@ PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$PROJECT_DIR"
 
 # 可配置参数（通过环境变量覆盖）
-CLIP_MODEL="${CLIP_MODEL:-openai/clip-vit-base-patch16}"
+CLIP_MODEL="${CLIP_MODEL:-/mnt/tidal-alsh01/dataset/redone/checkpoints/opensource/siglip2-so400m-patch16-512}"
 SAMPLE_FPS="${SAMPLE_FPS:-2.0}"
 KERNEL_SIZE="${KERNEL_SIZE:-5}"
 BATCH_SIZE="${BATCH_SIZE:-64}"

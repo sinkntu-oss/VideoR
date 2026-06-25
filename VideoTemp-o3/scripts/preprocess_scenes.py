@@ -27,7 +27,8 @@ Adaptive Event Segmentation 场景预处理脚本
         --batch_size 64 \
         --device cuda
 """
-
+import os
+os.environ["OPENCV_FFMPEG_LOGLEVEL"] = "16"
 import argparse
 import json
 import os
@@ -35,6 +36,8 @@ import sys
 import glob
 import logging
 from typing import Dict, List, Tuple, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 import numpy as np
 from tqdm import tqdm
@@ -188,12 +191,12 @@ def detect_event_boundaries(scores: np.ndarray) -> List[int]:
 
 
 # ============================================================
-# CLIP 特征提取
+# SigLIP2 特征提取
 # ============================================================
 
-def load_clip_model(model_name: str, device: str):
+def load_siglip_model(model_name: str, device: str):
     """
-    加载 CLIP 视觉编码器。
+    加载 SigLIP2 视觉编码器。
 
     Args:
         model_name: HuggingFace 模型名称或本地路径
@@ -203,18 +206,21 @@ def load_clip_model(model_name: str, device: str):
         (model, processor) 元组
     """
     import torch
-    from transformers import CLIPModel, CLIPProcessor
+    from transformers import SiglipVisionModel, SiglipImageProcessor
 
-    logger.info(f"加载 CLIP 模型: {model_name}")
+    logger.info(f"加载 SigLIP2 模型: {model_name}")
     logger.info(f"计算设备: {device}")
 
-    model = CLIPModel.from_pretrained(model_name, torch_dtype=torch.float16 if 'cuda' in device else torch.float32)
-    processor = CLIPProcessor.from_pretrained(model_name)
+    model = SiglipVisionModel.from_pretrained(
+        model_name,
+        torch_dtype=torch.float16 if 'cuda' in device else torch.float32
+    )
+    processor = SiglipImageProcessor.from_pretrained(model_name)
     model = model.to(device).eval()
 
     # 获取特征维度
-    dummy_dim = model.config.projection_dim
-    logger.info(f"CLIP 特征维度: {dummy_dim}")
+    feature_dim = model.config.hidden_size
+    logger.info(f"SigLIP2 特征维度: {feature_dim}")
 
     return model, processor
 
@@ -227,16 +233,16 @@ def extract_cls_features(
     device: str = 'cuda'
 ) -> np.ndarray:
     """
-    使用 CLIP 视觉编码器提取 [CLS] token embedding。
+    使用 SigLIP2 视觉编码器提取 [CLS] token embedding。
 
-    对每帧图像通过 CLIP 视觉编码器前向传播，
-    取投影后的 image feature 作为紧凑的帧级描述符。
+    对每帧图像通过 SigLIP2 视觉编码器前向传播，
+    取 [CLS] token 的特征作为紧凑的帧级描述符。
     输出经 L2 归一化得到单位范数表示。
 
     Args:
         frames: 帧列表，每帧为 (H, W, C) uint8 numpy 数组
-        model: CLIP 模型
-        processor: CLIP 图像处理器
+        model: SigLIP2 模型
+        processor: SigLIP2 图像处理器
         batch_size: 每批帧数
         device: 计算设备
 
@@ -257,8 +263,9 @@ def extract_cls_features(
         inputs = {k: v.to(device) for k, v in inputs.items()}
 
         with torch.no_grad():
-            # get_image_features 返回经投影层的 CLS 特征 (B, D)
-            features = model.get_image_features(**inputs)
+            # SigLIP2: 取 [CLS] token (第一个 token) 的特征
+            outputs = model(**inputs)
+            features = outputs.last_hidden_state[:, 0, :]
 
         all_features.append(features.float().cpu().numpy())
 
@@ -277,7 +284,8 @@ def extract_cls_features(
 
 def sample_video_frames(
     video_path: str,
-    sample_fps: float = 2.0
+    sample_fps: float = 2.0,
+    use_gpu: bool = True
 ) -> Tuple[List[np.ndarray], List[int], float, int]:
     """
     从视频中按目标帧率均匀采样帧。
@@ -285,6 +293,7 @@ def sample_video_frames(
     Args:
         video_path: 视频文件路径
         sample_fps: 采样帧率（Hz）
+        use_gpu: 是否使用 GPU 硬件加速解码（NVIDIA GPU 需要 CUDA 支持）
 
     Returns:
         (frames, sample_indices, orig_fps, total_frames)
@@ -293,9 +302,23 @@ def sample_video_frames(
         - orig_fps: 原始视频帧率
         - total_frames: 原始视频总帧数
     """
-    from decord import VideoReader, cpu
+    from decord import VideoReader, cpu, gpu
 
-    vr = VideoReader(video_path, ctx=cpu(0))
+    try:
+        # 尝试使用 GPU 硬件加速解码（NVIDIA NVDEC）
+        if use_gpu:
+            try:
+                vr = VideoReader(video_path, ctx=gpu(0))
+                logger.debug(f"使用 GPU 硬件加速解码: {video_path}")
+            except Exception as e:
+                logger.debug(f"GPU 解码失败，回退到 CPU: {e}")
+                vr = VideoReader(video_path, ctx=cpu(0))
+        else:
+            vr = VideoReader(video_path, ctx=cpu(0))
+    except Exception as e:
+        logger.warning(f"打开视频失败 {video_path}: {e}")
+        return [], [], 0.0, 0
+
     orig_fps = vr.get_avg_fps()
     total_frames = len(vr)
 
@@ -332,7 +355,8 @@ def process_single_video(
     sample_fps: float = 2.0,
     kernel_size: int = 5,
     batch_size: int = 64,
-    device: str = 'cuda'
+    device: str = 'cuda',
+    use_gpu_decode: bool = True
 ) -> Optional[Dict]:
     """
     对单个视频执行 Adaptive Event Segmentation。
@@ -347,6 +371,7 @@ def process_single_video(
         kernel_size: 对角差分卷积核大小
         batch_size: CLIP 推理批大小
         device: 计算设备
+        use_gpu_decode: 是否使用 GPU 硬件加速解码
 
     Returns:
         视频事件元数据字典，包含 events 列表
@@ -356,9 +381,9 @@ def process_single_video(
         return None
 
     try:
-        # 1. 采样帧
+        # 1. 采样帧（使用 GPU 硬件加速解码）
         frames, sample_indices, orig_fps, total_frames = sample_video_frames(
-            video_path, sample_fps
+            video_path, sample_fps, use_gpu=use_gpu_decode
         )
 
         duration = total_frames / orig_fps if orig_fps > 0 else 0.0
@@ -516,25 +541,25 @@ def collect_video_paths(data_dirs: List[str], project_root: str) -> set:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Adaptive Event Segmentation 场景预处理",
+        description="Adaptive Event Segmentation 场景预处理 (SigLIP2 + 多线程)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
-  # 使用 CLIP ViT-B/16，2fps 采样，5×5 核
+  # 使用 SigLIP2，2fps 采样，5×5 核，4 线程
   python scripts/preprocess_scenes.py \\
       --data_dirs sft/data rl/data \\
       --output scripts/scene_metadata.json \\
-      --clip_model openai/clip-vit-base-patch16 \\
-      --sample_fps 2.0 --kernel_size 5
+      --clip_model google/siglip-so400m-patch14-384 \\
+      --sample_fps 2.0 --kernel_size 5 --num_threads 4
 
-  # 使用本地 CLIP 模型路径
+  # 使用本地 SigLIP2 模型路径
   python scripts/preprocess_scenes.py \\
-      --clip_model /path/to/clip-vit-base-patch16 \\
-      --device cuda:0
+      --clip_model /path/to/siglip-so400m-patch14-384 \\
+      --device cuda:0 --num_threads 8
 
   # CPU 模式（较慢）
   python scripts/preprocess_scenes.py \\
-      --device cpu --batch_size 16
+      --device cpu --batch_size 16 --num_threads 2
         """
     )
     parser.add_argument("--data_dirs", nargs="+", default=["sft/data", "rl/data"],
@@ -543,16 +568,18 @@ def main():
                         help="输出元数据文件路径 (默认: scripts/scene_metadata.json)")
     parser.add_argument("--project_root", type=str, default=".",
                         help="项目根目录 (默认: 当前目录)")
-    parser.add_argument("--clip_model", type=str, default="openai/clip-vit-base-patch16",
-                        help="CLIP 模型名称或本地路径 (默认: openai/clip-vit-base-patch16)")
+    parser.add_argument("--clip_model", type=str, default="/mnt/tidal-alsh01/dataset/redone/checkpoints/opensource/siglip2-so400m-patch16-512",
+                        help="SigLIP2 模型名称或本地路径 (默认: /mnt/tidal-alsh01/dataset/redone/checkpoints/opensource/siglip2-so400m-patch16-512)")
     parser.add_argument("--sample_fps", type=float, default=2.0,
                         help="帧采样率 Hz (默认: 2.0)")
     parser.add_argument("--kernel_size", type=int, default=5,
                         help="对角差分卷积核大小，必须为奇数 (默认: 5)")
     parser.add_argument("--batch_size", type=int, default=64,
-                        help="CLIP 推理批大小 (默认: 64)")
+                        help="SigLIP2 推理批大小 (默认: 64)")
     parser.add_argument("--device", type=str, default="cuda",
                         help="计算设备 (默认: cuda)")
+    parser.add_argument("--num_threads", type=int, default=4,
+                        help="视频处理线程数 (默认: 4)")
     args = parser.parse_args()
 
     project_root = os.path.abspath(args.project_root)
@@ -562,9 +589,10 @@ def main():
     # 验证参数
     assert args.kernel_size % 2 == 1, f"kernel_size 必须为奇数，得到 {args.kernel_size}"
     assert args.sample_fps > 0, f"sample_fps 必须为正数，得到 {args.sample_fps}"
+    assert args.num_threads > 0, f"num_threads 必须为正数，得到 {args.num_threads}"
 
-    # 1. 加载 CLIP 模型
-    model, processor = load_clip_model(args.clip_model, args.device)
+    # 1. 加载 SigLIP2 模型（只加载一次）
+    model, processor = load_siglip_model(args.clip_model, args.device)
 
     # 2. 收集所有视频路径
     video_paths = collect_video_paths(args.data_dirs, project_root)
@@ -573,29 +601,45 @@ def main():
         logger.error("没有找到任何视频文件")
         sys.exit(1)
 
-    # 3. 逐视频处理（GPU 推理无法多进程并行，但批处理已充分利用 GPU）
+    # 3. 多线程并行处理视频
     metadata = {}
     failed = []
+    metadata_lock = threading.Lock()
 
     logger.info(f"开始处理 {len(video_paths)} 个视频...")
-    logger.info(f"CLIP 模型: {args.clip_model}")
-    logger.info(f"设备: {args.device} | 批大小: {args.batch_size}")
+    logger.info(f"SigLIP2 模型: {args.clip_model}")
+    logger.info(f"设备: {args.device} | 批大小: {args.batch_size} | 线程数: {args.num_threads}")
 
-    for vp in tqdm(sorted(video_paths), desc="Adaptive Event Segmentation"):
-        result = process_single_video(
-            video_path=vp,
-            model=model,
-            processor=processor,
-            sample_fps=args.sample_fps,
-            kernel_size=args.kernel_size,
-            batch_size=args.batch_size,
-            device=args.device
-        )
-        if result is not None:
-            rel_path = os.path.relpath(vp, project_root)
-            metadata[rel_path] = result
-        else:
-            failed.append(vp)
+    def process_video_worker(video_path: str):
+        """单个线程处理一个视频"""
+        try:
+            result = process_single_video(
+                video_path=video_path,
+                model=model,
+                processor=processor,
+                sample_fps=args.sample_fps,
+                kernel_size=args.kernel_size,
+                batch_size=args.batch_size,
+                device=args.device,
+                use_gpu_decode=True
+            )
+            
+            with metadata_lock:
+                if result is not None:
+                    rel_path = os.path.relpath(video_path, project_root)
+                    metadata[rel_path] = result
+                else:
+                    failed.append(video_path)
+        except Exception as e:
+            logger.error(f"处理视频异常 {video_path}: {e}")
+            with metadata_lock:
+                failed.append(video_path)
+
+    # 使用线程池并行处理
+    with ThreadPoolExecutor(max_workers=args.num_threads) as executor:
+        futures = [executor.submit(process_video_worker, vp) for vp in sorted(video_paths)]
+        for _ in tqdm(as_completed(futures), total=len(futures), desc="Adaptive Event Segmentation"):
+            pass
 
     # 4. 保存结果
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
@@ -609,9 +653,10 @@ def main():
 
     logger.info(f"\n{'='*60}")
     logger.info(f"Adaptive Event Segmentation 完成！")
-    logger.info(f"  算法: CLIP CLS → TSM → {args.kernel_size}×{args.kernel_size} 对角差分卷积核 → 自适应阈值")
-    logger.info(f"  CLIP 模型: {args.clip_model}")
+    logger.info(f"  算法: SigLIP2 CLS → TSM → {args.kernel_size}×{args.kernel_size} 对角差分卷积核 → 自适应阈值")
+    logger.info(f"  SigLIP2 模型: {args.clip_model}")
     logger.info(f"  采样帧率: {args.sample_fps} fps")
+    logger.info(f"  处理线程: {args.num_threads}")
     logger.info(f"  成功: {len(metadata)} 个视频")
     logger.info(f"  失败: {len(failed)} 个视频")
     logger.info(f"  总事件数: {total_events}")
