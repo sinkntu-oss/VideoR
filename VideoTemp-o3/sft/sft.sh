@@ -1,3 +1,4 @@
+PYTORCH_CUDA_ALLOC_CONF='expandable_segments:True' \
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 NPROC_PER_NODE=8 \
 VIDEO_MIN_PIXELS=50176 \
@@ -22,6 +23,7 @@ swift sft \
     --freeze_vit True \
     --freeze_aligner False \
     --freeze_llm False \
+    --gradient_checkpointing True \
     --num_train_epochs 3 \
     --per_device_train_batch_size 1 \
     --per_device_eval_batch_size 1 \

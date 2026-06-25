@@ -10,58 +10,90 @@
 
 ```
 VideoTemp-o3/
-├── README.md                    # 原始英文 README
-├── README_zh.md                 # 本文件（中文说明）
-├── requirement.txt              # Python 依赖
-├── setup_env.sh                 # 一键环境安装脚本（conda 环境 Tempo3）
-├── setup_data.sh                # 一键数据组织脚本（从 datasets/VideoTemp-o3 建立软链接）
-├── run_eval_videomme.sh         # Video-MME 评测快捷脚本
+├── README.md                        # 原始英文 README
+├── README_zh.md                     # 本文件（中文说明）
+├── requirement.txt                  # Python 依赖
+├── setup_env.sh                     # 一键环境安装脚本（conda 环境 Tempo3）
+├── setup_data.sh                    # 一键数据组织脚本（从 datasets/VideoTemp-o3 建立软链接）
+├── run_eval_videomme.sh             # Video-MME 评测快捷脚本
 │
-├── figs/                        # 论文图片
+├── figs/                            # 论文图片
 │   └── main.png
 │
-├── sft/                         # SFT 训练
-│   ├── sft.sh                   # SFT 训练启动脚本
-│   ├── loss_scale_plugin.py     # 自定义 loss scale 插件
-│   ├── data/                    # SFT 训练数据（标注 jsonl）
-│   │   ├── wo_tool_call/        # 冷启动数据（不含工具调用）
-│   │   │   ├── activitynet.jsonl
-│   │   │   ├── charades.jsonl
-│   │   │   ├── vidchapters.jsonl
-│   │   │   ├── video_r1_image_mc.jsonl
-│   │   │   └── video_r1_video.jsonl
-│   │   └── wi_tool_call/        # 含工具调用数据
-│   │       ├── activitynet.jsonl
-│   │       ├── longvila.jsonl
-│   │       └── qvhighlight.jsonl
-│   └── ckpt/                    # SFT 训练 checkpoint 输出目录
-│       └── test/                # 测试运行产出
+├── sft/                             # SFT 训练
+│   ├── sft.sh                       # SFT 训练启动脚本
+│   ├── loss_scale_plugin.py         # 自定义 loss scale 插件
+│   ├── data/                        # SFT 训练数据（标注 jsonl，均为软链接）
+│   │   ├── wo_tool_call/            # 冷启动数据（不含工具调用）
+│   │   │   ├── activitynet.jsonl    -> datasets/VideoTemp-o3/sft/activitynet.jsonl
+│   │   │   ├── charades.jsonl       -> datasets/VideoTemp-o3/sft/charades.jsonl
+│   │   │   ├── vidchapters.jsonl    -> datasets/VideoTemp-o3/sft/vidchapters.jsonl
+│   │   │   ├── video_r1_image_mc.jsonl -> datasets/VideoTemp-o3/sft/video_r1_image_mc.jsonl
+│   │   │   └── video_r1_video.jsonl -> datasets/VideoTemp-o3/sft/video_r1_video.jsonl
+│   │   └── wi_tool_call/            # 含工具调用数据
+│   │       ├── activitynet.jsonl    -> datasets/VideoTemp-o3/sft_tool_call/activitynet.jsonl
+│   │       ├── longvila.jsonl       -> datasets/VideoTemp-o3/sft_tool_call/longvila.jsonl
+│   │       └── qvhighlight.jsonl    -> datasets/VideoTemp-o3/sft_tool_call/qvhighlight.jsonl
+│   └── ckpt/                        # SFT 训练 checkpoint 输出目录
+│       └── test/                    # 测试运行产出（v0/v1/v2-*）
 │
-├── rl/                          # RL (GRPO) 训练
-│   ├── grpo.sh                  # GRPO 训练启动脚本（GPU 0-5）
-│   ├── rollout.sh               # Rollout 推理引擎启动脚本（GPU 6-7）
-│   ├── video_crop_plugin.py     # 视频裁剪工具调用插件
-│   └── data/                    # RL 训练数据（标注 jsonl）
-│       ├── qa.jsonl             # 视频 QA 奖励数据
-│       └── grounding.jsonl      # 时序定位奖励数据
+├── rl/                              # RL (GRPO) 训练
+│   ├── grpo.sh                      # GRPO 训练启动脚本（GPU 0-5）
+│   ├── rollout.sh                   # Rollout 推理引擎启动脚本（GPU 6-7）
+│   ├── video_crop_plugin.py         # 视频裁剪工具调用插件
+│   └── data/                        # RL 训练数据（标注 jsonl，均为软链接）
+│       ├── qa.jsonl                 -> datasets/VideoTemp-o3/rl/qa-1k.jsonl
+│       └── grounding.jsonl          -> datasets/VideoTemp-o3/rl/grounding.jsonl
 │
-└── eval/                        # 评测代码
-    ├── 7b_deploy_1024.sh        # vLLM 推理引擎部署脚本
-    ├── score.py                 # 统一评分脚本
-    ├── utils.py                 # 评测工具函数
-    ├── videomme/                # Video-MME 评测
-    │   ├── videomme.py
-    │   └── data/                # 评测数据存放位置
-    ├── mlvu/                    # MLVU 评测
-    │   └── mlvu.py
-    ├── lvbench/                 # LVBench 评测
-    │   └── lvbench.py
-    ├── videommmu/               # Video-MMMU 评测
-    │   └── videommmu.py
-    └── videotemp/               # VideoTemp-Bench 评测
-        ├── videotemp.py         # MCQ 评测
-        └── videotemp-g.py       # Grounding 评测
+├── eval/                            # 评测代码
+│   ├── 7b_deploy_1024.sh            # vLLM 推理引擎部署脚本
+│   ├── score.py                     # 统一评分脚本
+│   ├── utils.py                     # 评测工具函数
+│   ├── videomme/                    # Video-MME 评测
+│   │   ├── videomme.py
+│   │   ├── data/                    # 评测 parquet 数据
+│   │   └── agent_runs/              # 评测运行结果
+│   ├── mlvu/                        # MLVU 评测
+│   │   └── mlvu.py
+│   ├── lvbench/                     # LVBench 评测
+│   │   └── lvbench.py
+│   ├── videommmu/                   # Video-MMMU 评测
+│   │   └── videommmu.py
+│   └── videotemp/                   # VideoTemp-Bench 评测
+│       ├── videotemp.py             # MCQ 评测
+│       └── videotemp-g.py           # Grounding 评测
+│
+├── benchmarks/                      # Benchmark 数据
+│   └── Video-MME/
+│       └── data/                    # Video-MME 视频数据
+│
+├── result/                          # 推理结果
+│   └── Qwen2.5-VL-7B-Instruct/
+│       └── deploy_result/           # 部署推理输出 jsonl
+│
+├── logs/                            # 训练日志
+│   ├── sft_baseline.log
+│   └── sft_baseline_2.log
+│
+│── # ===== 以下为视频数据目录（软链接） =====
+│
+├── sft_videos/                      -> datasets/VideoTemp-o3/sft_videos（SFT 训练视频总目录）
+├── rl_videos/                       -> datasets/VideoTemp-o3/rl_videos （RL 训练视频总目录）
+│
+│── # ===== 以下为顶层视频快捷链接（指向 sft_videos/ 下对应子目录） =====
+│
+├── ActivityNet/                     -> sft_videos/ActivityNet
+├── Charades_v1/                     -> sft_videos/Charades_v1
+├── cropped_video/                   -> sft_videos/cropped_video
+├── LongVILA/                        -> sft_videos/LongVILA
+├── QVhilights/                      -> sft_videos/QVhilights
+├── VidChapters/                     -> sft_videos/VidChapters
+└── Video-R1-data/                   -> sft_videos/Video-R1-data
 ```
+
+> **说明**: 项目根目录下的 `ActivityNet/`、`Charades_v1/` 等是指向 `sft_videos/` 子目录的软链接。
+> jsonl 中的视频路径（如 `ActivityNet/videos/v_xxx.mp4`）从项目根目录开始解析，
+> 因此这些顶层软链接确保了训练时视频路径能正确找到。
 
 ---
 
