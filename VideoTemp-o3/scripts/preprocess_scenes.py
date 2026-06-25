@@ -28,7 +28,7 @@ Adaptive Event Segmentation 场景预处理脚本
         --device cuda
 """
 import os
-os.environ["OPENCV_FFMPEG_LOGLEVEL"] = "16"
+os.environ["OPENCV_FFMPEG_LOGLEVEL"] = "16" # 抑制mmco警告
 import argparse
 import json
 import os
