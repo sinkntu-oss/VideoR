@@ -14,8 +14,8 @@ agent*
 
 # 数据软连接进来的
 VideoTemp-o3/eval/videomme/data/
-VideoTemp-o3/sft/data
-VideoTemp-o3/rl/data
+VideoTemp-o3/sft/data*
+VideoTemp-o3/rl/data*
 VideoTemp-o3/sft_videos
 VideoTemp-o3/rl_videos
 VideoTemp-o3/ActivityNet

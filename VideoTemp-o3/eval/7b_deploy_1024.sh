@@ -2,8 +2,8 @@
 #   - 直接评测原始模型: 使用 Qwen2.5-VL-7B-Instruct 路径
 #   - 评测 SFT 后的模型: 改为 sft/ckpt/test 下的 checkpoint 路径
 #   - 评测 RL 后的模型:  改为 rl/ckpt/test 下的 checkpoint 路径
-MODEL_PATH="/mnt/tidal-alsh01/dataset/redone/checkpoints/opensource/Qwen2.5-VL-7B-Instruct"
-
+# MODEL_PATH="/mnt/tidal-alsh01/dataset/redone/checkpoints/opensource/Qwen2.5-VL-7B-Instruct"
+MODEL_PATH="/mnt/tidal-alsh01/dataset/eam_ds/VideoR/VideoTemp-o3/sft/ckpt/test/v2-20260624-204331/checkpoint-930"
 CUDA_VISIBLE_DEVICES=0 \
 DECORD_EOF_RETRY_MAX=20480 \
 VIDEO_MIN_PIXELS=50176 \
