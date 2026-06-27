@@ -8,10 +8,11 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 \
 NPROC_PER_NODE=6 \
 swift rlhf \
     --rlhf_type grpo \
-    --model sft/ckpt/test \
+    --model /mnt/tidal-alsh01/dataset/eam_ds/VideoR/VideoTemp-o3/sft/ckpt/test/v2-20260624-204331/checkpoint-930 \
+    --model_type qwen2_5_vl \
     --train_type full \
     --external_plugins rl/video_crop_plugin.py \
-    --reward_funcs acc_reward iou_reward tool_penalty format_reward \
+    --reward_funcs acc_reward iou_reward format_reward \
     --use_vllm true \
     --vllm_mode server \
     --vllm_server_host 0.0.0.0 \
