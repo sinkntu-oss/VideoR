@@ -136,3 +136,71 @@ SFT 只取第一个非 cropped 视频作主视频，RL 直接取 `videos[0]`。
 （tool_call、system prompt），未同步重写"多模态对齐层"
 （`<video>` 标签 ↔ videos 数组 ↔ 运行时插件产出）。
 其中 **问题 1 会导致事件版 SFT 直接无法运行**，应优先修复。
+
+---
+
+# 修复记录（2026-06-30）
+
+> 修改文件：`scripts/convert_annotations.py`（重写）、`rl/video_event_plugin.py`（奖励防护一处）
+> 所有修复均通过语法检查、核心函数自测与端到端对齐测试。
+
+## 🔴 P0 - 问题 1/3：多模态对齐（已修复）
+
+重写 `convert_sft_sample()`，按工具调用轮逐个对齐：
+- assistant 的 `tool_call` → `locate_events(event_ids)`；
+- 其后 user 消息的 `<video>` 数量重写为 `len(event_ids)`；
+- `videos` 数组重建为 `[主视频] + M 个事件片段路径`（移除 cropped_video）；
+- 新增 `crop_event_clip()` 按事件边界离线裁剪，采样逻辑与运行时 `EventLocatingScheduler` 完全一致，
+  保证 train-inference 一致；提供 `--no_crop_clips` 开关分离裁剪步骤；
+- 转换末尾做强一致性校验：`<video>` 总数 ≠ videos 数量则丢弃并计数（`align_mismatch`）。
+
+验证：端到端测试 `video_tags=4 == videos_len=4`，输出 `ALIGN OK`。
+
+## 🔴 P0 - 问题 2：think 推理链一致性（已修复）
+
+新增 `rewrite_think_timestamps()`，将 `<think>` 内带时间单位的区间（如 `8s - 25s`）
+改写为事件引用（`Events 1, 2, 3`）。保守匹配（要求时间单位），避免误伤普通数字。
+
+验证：`look at 8s - 25s` → `look at Events 1, 2, 3`，普通数字 `100` 保留不变。
+
+## 🔴 P0 - 问题 3：训练-推理片段数一致（已修复）
+
+随问题 1 一并解决：SFT 片段数 = 选中事件数 M，与运行时插件产出严格对齐；
+裁剪采样参数（FPS/帧数）与插件常量一致。
+
+## 🟠 P1 - 问题 4：空覆盖集奖励防护（已修复）
+
+- 运行时：`rl/video_event_plugin.py` 的 `_compute_event_f1()` 空 target 由"满分 1.0"改为返回 `0.0`，
+  消除"不调用工具"的捷径激励；
+- 转换侧：对空覆盖集样本进行 `empty_cover` 统计告警。
+
+## 🟠 P1 - 问题 6：路径匹配规范化（已修复）
+
+新增 `build_metadata_index()` + `lookup_metadata()`：对路径做 normpath 规范化、
+basename 唯一兜底；未命中升级为 warning 并以 `meta_miss` 计数。
+
+## 🟡 P2 - 问题 5：去除冗余 tool_event_ids（已修复）
+
+不再产出 `tool_event_ids`，统一以 tool_call 文本内 event_ids 为准；删除原 `tool_params` 字段。
+
+验证：转换输出 `has_tool_params=False`。
+
+## 🟡 P2 - 问题 7：覆盖集 epsilon 容差（已修复）
+
+`find_covering_events()` 改为基于**正重叠长度 + `OVERLAP_EPS`(1e-2)** 判定，
+并对极短目标区间加中点兜底，避免边界相切误判。
+
+验证：`[5,12]` 仅命中 event 1，未误纳相切的 event 0 / event 3。
+
+## 🟡 P2 - 问题 8：单主视频假设（暂未处理）
+
+当前仍以第一个非 cropped 视频为主视频。多视频样本较少，留待后续按需扩展。
+
+## 诊断统计
+
+主流程日志新增统计：元数据未命中(丢弃)、多模态对齐不一致(丢弃)、空覆盖集、事件片段裁剪失败。
+
+## 结论
+
+P0 全部修复，事件版 SFT 数据可正确生成（`<video>` ↔ videos ↔ event_ids 三者一致）；
+P1 健壮性与奖励漏洞已闭环；P2 除"多视频支持"外均已处理。

@@ -254,7 +254,9 @@ class BaseEventReward(ORM):
     def _compute_event_f1(self, selected: List[int], target: List[int]) -> float:
         """F1 分数衡量事件选择质量"""
         if not target:
-            return 1.0 if not selected else 0.0
+            # 空目标集通常意味着数据异常（事件应覆盖整段视频）。
+            # 不能让"不选任何事件"得满分，否则会激励模型不调用工具，统一返回 0。
+            return 0.0
         if not selected:
             return 0.0
         ss, ts = set(selected), set(target)
