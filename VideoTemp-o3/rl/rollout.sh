@@ -11,7 +11,7 @@ swift rollout \
     --multi_turn_scheduler video_processing_scheduler \
     --vllm_max_model_len 40960 \
     --vllm_tensor_parallel_size 2 \
-    --vllm_gpu_memory_utilization 0.75 \
+    --vllm_gpu_memory_utilization 0.6 \
     --vllm_mm_processor_cache_gb 0 \
     --max_turns 3 \
     --vllm_limit_mm_per_prompt '{"image": 1, "video": 10}' \
