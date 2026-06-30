@@ -18,7 +18,9 @@ import os
 import re
 import math
 import json
+import shutil
 import tempfile
+import time
 from datetime import datetime
 from typing import Dict, List, Optional
 
@@ -36,11 +38,20 @@ logger = get_logger()
 
 FPS_MIN_FRAMES, FPS_MAX_FRAMES, FRAME_FACTOR, FPS = 4, 64, 2, 2
 
+# 临时片段根目录 + 启动时清理阈值（小时）
+TEMP_CLIPS_ROOT = os.environ.get("EVENT_TEMP_CLIPS_ROOT", "rl/temp_videos")
+TEMP_CLIPS_CLEANUP_HOURS = int(os.environ.get("EVENT_TEMP_CLIPS_CLEANUP_HOURS", "24"))
+
+# 主视频相对路径兜底解析的根目录（默认 cwd，可通过环境变量显式指定）
+PROJECT_ROOT_FOR_VIDEOS = os.environ.get("VIDEOTEMP_PROJECT_ROOT", os.getcwd())
+
 TOOL_CALL_PAT = re.compile(r'<tool_call>(.*?)</tool_call>', re.DOTALL)
 ANSWER_PAT = re.compile(r'<answer>(.*?)</answer>', re.DOTALL)
 THINK_TOOL_PAT = re.compile(r"^<think>.*?</think>\s*<tool_call>.*?</tool_call>$", re.DOTALL)
 THINK_ANSWER_PAT = re.compile(r"^<think>.*?</think>\s*<answer>.*?</answer>$", re.DOTALL)
-EVENT_LINE_PAT = re.compile(r'Event\s+(\d+):\s+([\d.]+)s\s*-\s*([\d.]+)s')
+# [H1] 同时兼容 baseline (`Event 0: 0.0s - 3.2s`) 与 J (`Event 0 (0.0s-3.2s):`) 两种格式。
+# `(?:\s*\(|:\s*\(?)` 允许「冒号+可选括号」或「直接括号」两种分隔。
+EVENT_LINE_PAT = re.compile(r'Event\s+(\d+)(?:\s*\(|:\s*\(?)\s*([\d.]+)s\s*-\s*([\d.]+)s')
 
 EVENT_SUCCESS_PROMPT = "Tool execution successful. Analyze the visual information from the provided event clips to answer the user's question."
 EVENT_FAIL_PROMPT = "Tool execution failed. Please continue your analysis based on your existing knowledge and the information from the conversation so far."
@@ -68,6 +79,36 @@ def parse_event_ids(text: str, accumulate: bool = False) -> List[int]:
 
 class EventLocatingScheduler(MultiTurnScheduler):
     """基于事件的多轮视频处理调度器"""
+
+    # 进程内只清理一次（多 worker 启动时各自清理一次，幂等无副作用）
+    _cleanup_done = False
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if not EventLocatingScheduler._cleanup_done:
+            self._cleanup_stale_temp(TEMP_CLIPS_ROOT, TEMP_CLIPS_CLEANUP_HOURS)
+            EventLocatingScheduler._cleanup_done = True
+
+    @staticmethod
+    def _cleanup_stale_temp(root: str, hours: int) -> None:
+        """[H4] 启动时清理超过 N 小时的临时片段子目录，防止磁盘无限增长。"""
+        if hours <= 0 or not os.path.isdir(root):
+            return
+        cutoff = time.time() - hours * 3600
+        removed = 0
+        try:
+            for name in os.listdir(root):
+                p = os.path.join(root, name)
+                try:
+                    if os.path.isdir(p) and os.path.getmtime(p) < cutoff:
+                        shutil.rmtree(p, ignore_errors=True)
+                        removed += 1
+                except OSError:
+                    continue
+            if removed:
+                logger.info(f"[temp_clips] 清理过期临时目录: {removed} 个 (older than {hours}h, root={root})")
+        except OSError as e:
+            logger.warning(f"[temp_clips] 清理失败 {root}: {e}")
 
     def _get_video_info(self, video_path: str):
         if not os.path.exists(video_path):
@@ -99,7 +140,8 @@ class EventLocatingScheduler(MultiTurnScheduler):
             if clip_dur <= 0:
                 raise ValueError(f"Empty clip: {start_time}-{end_time}")
 
-            tmp_dir = "rl/temp_videos/" + datetime.now().strftime("%Y%m%d_%H%M%S")
+            # [H4] 目录粒度改为按小时聚集，避免每秒一个子目录无限增长
+            tmp_dir = os.path.join(TEMP_CLIPS_ROOT, datetime.now().strftime("%Y%m%d_%H"))
             os.makedirs(tmp_dir, exist_ok=True)
             tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False, dir=tmp_dir)
             out_path = tmp.name
@@ -170,12 +212,17 @@ class EventLocatingScheduler(MultiTurnScheduler):
             return self._parse_events_from_system_text(getattr(infer_request, 'messages', None))
         return events or None
 
+    # [M9] 相对路径首次告警标志（类级，避免日志刷屏）
+    _relpath_warned = False
+    # [H3] source_video 拿不到时首次告警标志
+    _missing_src_warned = False
+
     def _get_source_video(self, infer_request) -> Optional[str]:
         """获取主视频路径：优先样本元数据 source_video → 兜底 videos[0]。
 
-        方案 D 取消了主视频（videos 字段仅留 tool 调用产物甚至为空），故需要从样本
-        元数据 `source_video` 字段拿到原视频路径来做 tool 调用裁剪。其他方案下
-        videos[0] 即主视频，自动走兜底分支，行为不变。
+        方案 D/J 取消了主视频（videos 字段仅留 tool 调用产物甚至为空），故需要从
+        样本元数据 `source_video` 字段拿到原视频路径来做 tool 调用裁剪。其他方案
+        下 videos[0] 即主视频，自动走兜底分支，行为不变。
 
         访问优先级（与 _get_events 对齐）：
           1. infer_request.source_video    （属性）
@@ -183,7 +230,9 @@ class EventLocatingScheduler(MultiTurnScheduler):
           3. infer_request[...]            （dict-like）
           4. infer_request.videos[0]       （baseline 兜底）
 
-        相对路径会基于 cwd 拼成绝对路径（与 ms-swift 加载 videos 字段的行为一致）。
+        [M9] 相对路径用 PROJECT_ROOT_FOR_VIDEOS 兜底解析（默认 cwd，
+             可通过 VIDEOTEMP_PROJECT_ROOT 环境变量显式指定），并首次告警。
+        [H3] 全部 fallback 失败时 logger.error 让运维能定位（不再静默返回 None）。
         """
         src = getattr(infer_request, 'source_video', None)
         if not src:
@@ -198,9 +247,27 @@ class EventLocatingScheduler(MultiTurnScheduler):
         if not src:
             vids = getattr(infer_request, 'videos', None) or []
             if not vids:
+                if not EventLocatingScheduler._missing_src_warned:
+                    logger.error(
+                        "[_get_source_video] 拿不到主视频路径："
+                        "infer_request 既没有 'source_video' 字段（D/J 必需），"
+                        "也没有 'videos' 字段（baseline 兜底）。"
+                        "这通常意味着 ms-swift 未把 jsonl 顶层 'source_video' 字段透传到 InferRequest。"
+                        "请用 scripts/plan_j/verify_fields.py 校验数据集字段是否齐全。"
+                    )
+                    EventLocatingScheduler._missing_src_warned = True
                 return None
             src = vids[0]
-        return src if os.path.isabs(src) else os.path.abspath(src)
+        if os.path.isabs(src):
+            return src
+        if not EventLocatingScheduler._relpath_warned:
+            logger.warning(
+                f"[_get_source_video] source_video 为相对路径 '{src}'，"
+                f"以 PROJECT_ROOT_FOR_VIDEOS='{PROJECT_ROOT_FOR_VIDEOS}' 兜底解析。"
+                f"如不正确，请设置环境变量 VIDEOTEMP_PROJECT_ROOT=/abs/path/to/VideoTemp-o3。"
+            )
+            EventLocatingScheduler._relpath_warned = True
+        return os.path.join(PROJECT_ROOT_FOR_VIDEOS, src)
 
     def check_finished(self, infer_request, response_choice, current_turn) -> bool:
         if ANSWER_PAT.search(response_choice.message.content):
@@ -210,23 +277,22 @@ class EventLocatingScheduler(MultiTurnScheduler):
     def step(self, infer_request, response_choice, current_turn) -> Dict:
         try:
             completion = response_choice.message.content
+            # [H5] 全程用本地变量 src_video，杜绝多 trajectory 并发时 self.current_video_path 串扰。
+            #      vLLM async + GRPO num_generations=N 会让一个 scheduler 实例被 N 个 trajectory 共享。
             src_video = self._get_source_video(infer_request)
-            if src_video:
-                self.current_video_path = src_video
-
             events = self._get_events(infer_request)
             selected_ids = parse_event_ids(completion)  # 取首个 tool_call
             processed_paths, errors = [], []
 
-            if selected_ids and events and hasattr(self, 'current_video_path'):
+            if selected_ids and events and src_video:
                 valid = {e["event_id"]: e for e in events}
                 chosen = [valid[i] for i in selected_ids if i in valid][:5]
                 if not chosen:
                     errors.append("[Error] No valid event IDs.")
                 else:
-                    logger.info(f"Events {[e['event_id'] for e in chosen]} from {self.current_video_path}")
+                    logger.info(f"Events {[e['event_id'] for e in chosen]} from {src_video}")
                     for ev in chosen:
-                        result = self._crop_event(self.current_video_path, ev["start_time"], ev["end_time"])
+                        result = self._crop_event(src_video, ev["start_time"], ev["end_time"])
                         (processed_paths if os.path.exists(result) else errors).append(result)
 
                 if not errors and processed_paths:

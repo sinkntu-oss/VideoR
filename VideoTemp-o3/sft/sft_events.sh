@@ -50,18 +50,37 @@ VIDEO_MIN_PIXELS=50176 \
 VIDEO_MAX_PIXELS=50176 \
 DECORD_EOF_RETRY_MAX=20480 \
 FPS_MAX_FRAMES=512 \
+# [M7] 数据集存在性校验：缺失或空文件立刻报错，避免训练启动到一半才崩
+DATASET_FILES=(
+    "$DATA_DIR/wo_tool_call/activitynet.jsonl"
+    "$DATA_DIR/wo_tool_call/charades.jsonl"
+    "$DATA_DIR/wo_tool_call/vidchapters.jsonl"
+    "$DATA_DIR/wo_tool_call/video_r1_image_mc.jsonl"
+    "$DATA_DIR/wo_tool_call/video_r1_video.jsonl"
+    "$DATA_DIR/wi_tool_call/activitynet.jsonl"
+    "$DATA_DIR/wi_tool_call/qvhighlight.jsonl"
+    "$DATA_DIR/wi_tool_call/longvila.jsonl"
+)
+MISSING=()
+for f in "${DATASET_FILES[@]}"; do
+    if [ ! -s "$f" ]; then
+        MISSING+=("$f")
+    fi
+done
+if [ ${#MISSING[@]} -gt 0 ]; then
+    echo "[ERROR] 以下数据文件缺失或为空（共 ${#MISSING[@]} 个）:" >&2
+    for f in "${MISSING[@]}"; do echo "  - $f" >&2; done
+    echo "[ERROR] 请先运行: PROMPT_STYLE=$PROMPT_STYLE bash scripts/prepare_event_data.sh" >&2
+    echo "[ERROR] 或检查 $DATA_DIR/ 转换日志找出失败原因" >&2
+    exit 1
+fi
+echo "[OK] 数据集文件校验通过（${#DATASET_FILES[@]} 个 jsonl 全部就绪）"
+
 swift sft \
     --model /mnt/tidal-alsh01/dataset/redone/checkpoints/opensource/Qwen2.5-VL-7B-Instruct \
     --model_type qwen2_5_vl \
     --train_type full \
-    --dataset $DATA_DIR/wo_tool_call/activitynet.jsonl \
-            $DATA_DIR/wo_tool_call/charades.jsonl \
-            $DATA_DIR/wo_tool_call/vidchapters.jsonl \
-            $DATA_DIR/wo_tool_call/video_r1_image_mc.jsonl \
-            $DATA_DIR/wo_tool_call/video_r1_video.jsonl \
-            $DATA_DIR/wi_tool_call/activitynet.jsonl \
-            $DATA_DIR/wi_tool_call/qvhighlight.jsonl \
-            $DATA_DIR/wi_tool_call/longvila.jsonl \
+    --dataset "${DATASET_FILES[@]}" \
     --torch_dtype bfloat16 \
     --external_plugins sft/loss_scale_plugin.py \
     --loss_scale last_two_rounds \

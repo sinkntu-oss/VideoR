@@ -71,7 +71,7 @@ swift rlhf \
     --freeze_llm false \
     --dataset $DATA_DIR/qa.jsonl $DATA_DIR/grounding.jsonl \
     --split_dataset_ratio 0 \
-    --max_completion_length 4096 \
+    --max_completion_length 8192 \
     --num_train_epochs 1 \
     --per_device_train_batch_size 1 \
     --learning_rate 5e-6 \
