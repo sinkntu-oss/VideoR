@@ -126,14 +126,48 @@ class EventLocatingScheduler(MultiTurnScheduler):
         except Exception as e:
             return f"[Error] {e}"
 
-    def _parse_events_from_system(self, messages: List[Dict]) -> Optional[List[Dict]]:
-        """从 system prompt 解析事件列表。"""
+    def _parse_events_from_system_text(self, messages: List[Dict]) -> Optional[List[Dict]]:
+        """[兜底] 从 system prompt 文本中 regex 解析事件列表（baseline prompt 形态）。"""
         if not messages or messages[0].get("role") != "system":
             return None
         events = [{"event_id": int(m.group(1)),
                    "start_time": float(m.group(2)),
                    "end_time": float(m.group(3))}
                   for m in EVENT_LINE_PAT.finditer(messages[0].get("content", ""))]
+        return events or None
+
+    def _get_events(self, infer_request) -> Optional[List[Dict]]:
+        """获取事件列表：优先样本元数据 → 兜底 system 文本 regex。
+
+        让 events 数据源与 prompt 形态解耦：B/C/D 等改 prompt 的方案不需要把
+        事件列表硬写进 system，只要样本顶层保留 `events` 字段即可。
+
+        访问优先级（兼容不同 ms-swift 版本对额外字段的挂载方式）：
+          1. infer_request.events          （属性）
+          2. infer_request.data_dict       （dict 字段）
+          3. infer_request[...]            （dict-like）
+          4. system 文本 regex             （baseline 兜底，行为不变）
+        """
+        raw = getattr(infer_request, 'events', None)
+        if not raw:
+            dd = getattr(infer_request, 'data_dict', None)
+            if isinstance(dd, dict):
+                raw = dd.get('events')
+        if not raw:
+            try:
+                raw = infer_request['events']  # type: ignore[index]
+            except (TypeError, KeyError, AttributeError):
+                pass
+        if not raw:
+            return self._parse_events_from_system_text(getattr(infer_request, 'messages', None))
+
+        try:
+            events = [{"event_id": int(e["event_id"]),
+                       "start_time": float(e["start_time"]),
+                       "end_time": float(e["end_time"])} for e in raw]
+        except (TypeError, KeyError, ValueError) as ex:
+            logger.warning(f"[_get_events] malformed events field, fallback to system text: {ex}")
+            return self._parse_events_from_system_text(getattr(infer_request, 'messages', None))
         return events or None
 
     def check_finished(self, infer_request, response_choice, current_turn) -> bool:
@@ -147,7 +181,7 @@ class EventLocatingScheduler(MultiTurnScheduler):
             if infer_request.videos:
                 self.current_video_path = infer_request.videos[0]
 
-            events = self._parse_events_from_system(infer_request.messages)
+            events = self._get_events(infer_request)
             selected_ids = parse_event_ids(completion)  # 取首个 tool_call
             processed_paths, errors = [], []
 
