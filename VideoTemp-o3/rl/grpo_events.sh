@@ -17,6 +17,7 @@ swift rlhf \
     --train_type full \
     --external_plugins rl/video_event_plugin.py \
     --reward_funcs acc_reward event_reward tool_penalty format_reward \
+    --reward_weights 1.0 0.5 1.0 0.2 \
     --use_vllm true \
     --vllm_mode server \
     --vllm_server_host 0.0.0.0 \

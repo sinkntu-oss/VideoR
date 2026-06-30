@@ -49,7 +49,9 @@ EVENT_FAIL_PROMPT = "Tool execution failed. Please continue your analysis based 
 def parse_event_ids(text: str, accumulate: bool = False) -> List[int]:
     """解析 locate_events 的 event_ids。accumulate=True 时累积所有 tool_call（用于奖励）。"""
     ids: List[int] = []
-    matches = TOOL_CALL_PAT.findall(text) if accumulate else TOOL_CALL_PAT.findall(text)[:1]
+    matches = TOOL_CALL_PAT.findall(text)
+    if not accumulate:
+        matches = matches[:1]
     for content in matches:
         try:
             tc = json.loads(content.strip())
@@ -212,7 +214,14 @@ class BaseEventReward(ORM):
 
     def _compute_answer_reward(self, model_answers, ref_answers, data_types, events_list=None, covering_list=None):
         def first_letter(s):
-            return next((ch for ch in (s or "").strip() if ch.isalpha()), "")
+            # 缺陷6修复：剥离 "The answer is" 等前缀，避免把 'T' 当成选项
+            s = (s or "").strip()
+            for p in ("the best answer is", "the correct answer is", "the answer is",
+                      "the best option is", "the correct option is", "answer:", "option:"):
+                if s.lower().startswith(p):
+                    s = s[len(p):].strip()
+                    break
+            return next((ch for ch in s if ch.isalpha()), "")
 
         rewards = []
         for i, dtype in enumerate(data_types):
@@ -263,79 +272,72 @@ orms['acc_reward'] = Accuracy_Reward
 
 
 class Event_Reward(BaseEventReward):
-    """事件选择奖励：答案正确时评估事件选择的 F1"""
+    """事件选择奖励：定位 F1（与答案解耦、连续、无跳变）。
+
+    修复激励倒挂(缺陷1)与 acc 门控(缺陷2)、奖励不连续(缺陷4)：
+    - 不再要求答案正确才给定位奖励，答案错也按 F1 给稠密信号（解除冷启动鸡生蛋）；
+    - 去掉 f1<0.1 的 -0.1 负跳变，使"调用全错"(0) 不再低于"不调用"(0)，消除激励倒挂；
+    - 选对得正分，保证 "调用选对" > "不调用" >= "调用全错"。
+    多选由 F1 的 precision 自然惩罚，不再叠加 ToolPenalty(缺陷5)。"""
     def __call__(self, completions, **kwargs):
         tids = kwargs.get('request_id', [])
-        ma, ra, dt, el, cl, sl = self._extract_trajectory_data(tids, kwargs.get('trajectory_inputs', {}))
-        acc = self._compute_answer_reward(ma, ra, dt, el, cl)
-
-        rewards = []
-        for i in range(len(tids)):
-            if acc[i] >= 0.5 and cl[i] and sl[i]:
-                f1 = self._compute_event_f1(sl[i], cl[i])
-                rewards.append(f1 if f1 >= 0.1 else f1 - 0.1)
-            else:
-                rewards.append(0.0)
-        return rewards
+        _, _, _, _, cl, sl = self._extract_trajectory_data(tids, kwargs.get('trajectory_inputs', {}))
+        return [self._compute_event_f1(sl[i], cl[i]) if (cl[i] and sl[i]) else 0.0
+                for i in range(len(tids))]
 
 orms['event_reward'] = Event_Reward
 
 
 class FormatReward(ORM):
-    """格式规范性奖励：每轮须为 <think>+<tool_call> 或 <think>+<answer>。"""
+    """格式规范性奖励：合格 assistant 轮占比(0~1)。
+
+    修复缺陷7：从"全有全无"改为按比例(更稠密、长轨迹不再因单轮出错全盘归零)；
+    遍历 role=='assistant' 的消息而非硬编码偶数索引(消除结构偏移误判)。
+    每轮须为 <think>+<tool_call>(且 tool_call 合法) 或 <think>+<answer>。"""
     def __call__(self, completions, **kwargs):
         tids = kwargs.get('request_id', [])
         gt = kwargs.get('trajectory_inputs', {})
         rewards = []
         for tid in tids:
             msgs = _last_traj(gt, tid).get('messages', [])
-            reward = 1.0
-            for resp in [msgs[i].get('content', '') for i in range(2, len(msgs), 2)]:
-                ok_tool = bool(THINK_TOOL_PAT.fullmatch(resp))
-                if not (ok_tool or THINK_ANSWER_PAT.fullmatch(resp)):
-                    reward = 0.0
-                    break
-                if ok_tool:
+            responses = [m.get('content', '') for m in msgs if m.get('role') == 'assistant']
+            if not responses:
+                rewards.append(0.0)
+                continue
+            ok = 0
+            for resp in responses:
+                is_tool = bool(THINK_TOOL_PAT.fullmatch(resp))
+                if not (is_tool or THINK_ANSWER_PAT.fullmatch(resp)):
+                    continue
+                if is_tool:
                     try:
                         tc = json.loads(TOOL_CALL_PAT.search(resp).group(1).strip())
                         assert tc['name'] == 'locate_events'
                         assert isinstance(tc['arguments']['event_ids'], list)
                     except Exception:
-                        reward = 0.0
-                        break
-            rewards.append(reward)
+                        continue
+                ok += 1
+            rewards.append(ok / len(responses))
         return rewards
 
 orms['format_reward'] = FormatReward
 
 
 class ToolPenalty(ORM):
-    """工具使用惩罚：多次调用 -0.1/次，过度多选 -0.05/个，下限 -0.5。"""
+    """工具使用惩罚：仅惩罚重复多次调用(-0.1/次, 下限 -0.5)。
+
+    修复缺陷5：移除"过度多选"惩罚——多选已由 Event_Reward 的 F1 precision 惩罚，
+    避免双重施压；同时消除原先依赖 covering_event_ids 而对 grounding(用
+    gt_covering_event_ids)失效、口径不一致的问题。"""
     def __call__(self, completions, **kwargs):
         tids = kwargs.get('request_id', [])
         gt = kwargs.get('trajectory_inputs', {})
         rewards = []
         for tid in tids:
-            traj = _last_traj(gt, tid)
-            msgs = traj.get('messages', [])
-            tc_count = total_sel = 0
-            for msg in msgs:
-                if msg.get('role') == 'assistant':
-                    calls = TOOL_CALL_PAT.findall(msg.get('content', ''))
-                    tc_count += len(calls)
-                    for c in calls:
-                        try:
-                            tc = json.loads(c.strip())
-                            if tc.get("name") == "locate_events":
-                                total_sel += len(tc["arguments"].get("event_ids", []))
-                        except Exception:
-                            pass
-            penalty = 0.0
-            if tc_count > 1:
-                penalty -= 0.1 * (tc_count - 1)
-            cov = traj.get('covering_event_ids', [])
-            if cov and total_sel > len(cov) + 2:
-                penalty -= 0.05 * (total_sel - len(cov) - 2)
+            msgs = _last_traj(gt, tid).get('messages', [])
+            tc_count = sum(len(TOOL_CALL_PAT.findall(m.get('content', '')))
+                           for m in msgs if m.get('role') == 'assistant')
+            penalty = -0.1 * (tc_count - 1) if tc_count > 1 else 0.0
             rewards.append(max(penalty, -0.5))
         return rewards
 

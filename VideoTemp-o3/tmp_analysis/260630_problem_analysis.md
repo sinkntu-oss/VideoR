@@ -204,3 +204,152 @@ basename 唯一兜底；未命中升级为 warning 并以 `meta_miss` 计数。
 
 P0 全部修复，事件版 SFT 数据可正确生成（`<video>` ↔ videos ↔ event_ids 三者一致）；
 P1 健壮性与奖励漏洞已闭环；P2 除"多视频支持"外均已处理。
+
+---
+
+# 奖励设计审查（2026-06-30）
+
+> 审查对象：`rl/video_event_plugin.py` 的 4 个奖励函数（acc / event / format / tool_penalty）。
+> 结论：计算正确性基本无 bug，但**激励方向**存在结构性缺陷，部分与论文
+> "agentic thinking-with-videos" 初衷相悖。以下按严重程度排列，含问题/后果/修复方向。
+
+## 🔴 P0 - 缺陷 1：激励倒挂，RL 会学会"少用甚至不用工具"
+
+**问题**：四个奖励默认等权相加，但没有任何机制奖励"主动调用工具"，
+`ToolPenalty` 只罚多调用；`Event_Reward` 中"未调用工具"(`sl` 空)返回 0(中性)，
+"调用但选错"返回 −0.1(负)。
+
+**后果**：以 QA 样本三种轨迹（GRPO 组内对比）为例：
+- A. 不调用工具直接答对：acc1 + event0 + format1 + tool0 = **2.0**
+- B. 调用工具选对答对：acc1 + event1 + format1 + tool0 = 3.0
+- C. 调用工具选错蒙对：acc1 + event(−0.1) + format1 + tool0 = **1.9**
+
+A(2.0) > C(1.9)：模型不确定时"干脆不调用"优于"调用但选错"，
+RL 收敛到回避工具调用，退化为"看全片直接答"，违背核心卖点。
+
+**修复方向**：让"调用且选对"始终严格优于"不调用"；对"未调用"对称化处理
+（给小负基线），或显式奖励合理调用。
+
+## 🔴 P0 - 缺陷 2：定位奖励被 acc 门控 → 冷启动稀疏（鸡生蛋）
+
+**问题**：`Event_Reward` 要求 `acc >= 0.5` 才算定位 F1。对 QA，acc 是 0/1，
+即必须先答对才奖励定位，而答对又依赖看对片段。
+
+**后果**：训练早期答对率低 → event_reward 恒为 0 → 定位无梯度 →
+看不到正确片段 → 答对率上不去。定位这一更稠密的早期信号被绑死在最终答案上。
+
+**修复方向**：解耦，答案错时也给降权的定位 F1，让定位先于答案学起来。
+
+## 🟠 P1 - 缺陷 3：grounding 奖励语义重复且混乱
+
+`acc_reward`(用 answer 文本时间戳→事件)与 `event_reward`(用 tool_call 选事件)
+对 grounding 都在算事件 F1，复用同一 `covering_list`。名为 Accuracy 实为 F1，
+与 QA 的 0/1 语义不同尺度；且事件版删除了原 `normalize_list` 跨任务归一化，加剧尺度不一致。
+
+## 🟠 P1 - 缺陷 5：多选"双重惩罚"且对 grounding 失效
+
+- 双重惩罚：`Event_Reward` 累积所有轮 event_ids 会拉低 F1 precision，
+  `ToolPenalty` 又对多选额外扣分，同一行为被罚两次。
+- grounding 失效：`ToolPenalty` 只读 `covering_event_ids`，而 grounding GT 存在
+  `gt_covering_event_ids`，导致 `cov=[]`，多选惩罚不触发，口径不一致。
+
+## 🟠 P1 - 缺陷 4：F1<0.1 的 −0.1 造成奖励不连续
+
+`f1 if f1>=0.1 else f1-0.1` 在 0.1 处有 0.1 跳变，优势估计在阈值附近突变，
+magic number 无依据。修复：用连续塑形替代硬阈值。
+
+## 🟡 P2 - 缺陷 6：QA 答案提取脆弱
+
+`first_letter` 取首个字母，`<answer>The answer is C</answer>` 会取到 'T' 判错。
+评测侧 `_extract_videomme_answer` 已处理前缀，奖励侧未处理，RL 探索期会引入标签噪声。
+
+## 🟡 P2 - 缺陷 7：FormatReward 全有全无 + 索引脆弱 + 权重偏大
+
+- 任一轮格式错整条归零，长轨迹信号稀疏；
+- `range(2,len(msgs),2)` 硬编码 assistant 在偶数位，结构偏移会误判；
+- format∈{0,1} 与 acc 等权，模型可能优先凑格式而非答对。
+
+## 🟡 P2 - 缺陷 8：整体 reward 尺度未平衡
+
+acc∈{0,1}、event∈[−0.1,1]、format∈{0,1}、tool∈[−0.5,0]，等权相加时
+format+acc 主导，定位(常被门控为 0)权重被压低；若未配 `reward_weights`，定位信号被淹没。
+
+## 优先级汇总
+
+| 优先级 | 缺陷 | 后果 |
+|--------|------|------|
+| P0 | 1 激励倒挂 | RL 收敛到"不用工具"，违背论文核心 |
+| P0 | 2 acc 门控 | 定位冷启动稀疏，鸡生蛋 |
+| P1 | 3 / 5 | 奖励口径不一致、双重惩罚 |
+| P1 | 4 / 8 | 优化不稳定、定位信号被淹没 |
+| P2 | 6 / 7 | 标签噪声、格式凑数 |
+
+## 结论
+
+奖励在数学上自洽，但把模型推向"少定位、直接答"，与 VideoTemp-o3 想要的
+"主动按需定位"相反。最该优先解决缺陷 1（激励倒挂）与缺陷 2（定位门控）。
+
+---
+
+# 奖励设计修复记录（2026-06-30）
+
+> 修改文件：`rl/video_event_plugin.py`（4 个奖励函数）、`rl/grpo_events.sh`（reward_weights）
+> 验证：语法检查通过；独立数值模拟确认 B>A（鼓励调用选对）、C≥A（倒挂消除）。
+
+## 🔴 P0 - 缺陷 1/2/4：重构 Event_Reward（已修复）
+
+将 `Event_Reward` 由"acc 门控 + f1<0.1 减 0.1"改为**纯定位 F1**：
+```python
+return [self._compute_event_f1(sl[i], cl[i]) if (cl[i] and sl[i]) else 0.0
+        for i in range(len(tids))]
+```
+- 缺陷 2：去掉 `acc>=0.5` 门控 → 答案错也给定位 F1，解除冷启动鸡生蛋；
+- 缺陷 4：去掉 `-0.1` 负跳变 → 奖励连续；
+- 缺陷 1：因去掉 `-0.1`，"调用全错"(0) 不再低于"不调用"(0)，倒挂消除；"调用选对"(>0) 仍严格更高。
+
+验证：A 不调用=2.0 / C 调用选错=2.0 / B 调用选对=3.0 → B>A=C，倒挂消除。
+
+## 🔴 P1 - 缺陷 5：简化 ToolPenalty（已修复）
+
+移除"过度多选 −0.05/个"惩罚，仅保留"多次调用 −0.1/次（下限 −0.5）"：
+- 多选已由 Event_Reward 的 F1 precision 自然惩罚，避免双重施压；
+- 不再依赖 `covering_event_ids`，消除原先对 grounding(用 `gt_covering_event_ids`)失效的口径不一致。
+
+## 🟠 P2 - 缺陷 7：重构 FormatReward（已修复）
+
+从"全有全无"改为**合格 assistant 轮占比 (ok/总轮数, 0~1)**，更稠密；
+并遍历 `role=='assistant'` 的消息替代硬编码 `range(2,len,2)`，消除结构偏移误判。
+
+验证：2/3 轮合格 → 0.67。
+
+## 🟡 P2 - 缺陷 6：增强 QA 答案提取（已修复）
+
+`first_letter` 增加前缀剥离（"The answer is" / "Answer:" 等），
+避免 `<answer>The answer is C</answer>` 被误取为 'T'。
+
+## 🟠 P1 - 缺陷 8：配置 reward_weights（已修复）
+
+在 `grpo_events.sh` 增加：
+```
+--reward_weights 1.0 0.5 1.0 0.2 \
+```
+对应 `acc_reward event_reward tool_penalty format_reward`：突出答案(1.0)与工具惩罚(1.0)，
+定位为辅助稠密信号(0.5)，格式降权(0.2)避免"凑格式压过答对"。
+
+## 🟡 缺陷 3：grounding 语义（设计权衡，未改代码）
+
+`acc_reward`(答案时间戳→事件 F1) 与 `event_reward`(工具选择 F1) 分别衡量
+"答案质量"与"中间定位质量"，关注点不同，保留为合理分工；
+跨任务尺度差异由 GRPO 组内 advantage 归一化（同 prompt 同任务）缓解。
+
+## 修复后激励结构（covering={1,2}, 权重 1.0/0.5/1.0/0.2）
+
+| 轨迹 | raw | weighted |
+|------|-----|----------|
+| A 不调用答对 | 2.00 | 1.20 |
+| B 调用选对答对 | 3.00 | **1.70** |
+| C 调用选错(1次) | 2.00 | 1.20 |
+| C2 调用选错(2次) | 1.90 | 1.10 |
+
+B 严格最优（鼓励主动定位且选对），C≥A（不再因"尝试定位"被倒挂惩罚），
+C2 因重复调用被合理惩罚。激励方向已与"agentic 按需定位"对齐。
