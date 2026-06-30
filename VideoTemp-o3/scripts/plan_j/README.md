@@ -135,3 +135,53 @@ j) DATA_DIR="{sft|rl}/data_events_j" ;;
 # rl/rollout_events.sh
 j) IMAGE_LIMIT=32 ;;   # 每事件 1 张，N 通常 ≤ 30
 ```
+
+---
+
+## 已知问题与设计权衡
+
+> 以下是 J 方案在实现过程中识别出的潜在问题；P0/P1 已在代码中修复，P2 作为长期改进项保留。
+
+### 🔴 高危（P0，已修复）
+
+#### P0-1 · caption 中的特殊字符破坏 prompt 结构
+**风险**：harvest 来源的 sentences 经常含 `\n`、`"`，会让 system prompt 错行或视觉破损。
+**修复**：在 [`build_system_prompt`](convert_annotations_j.py) 与 [`harvest_captions`](generate_event_captions.py) 都做一次清洗（`\n→空格`、`"→'`、`\r→空格`）。
+
+#### P0-2 · `EVENT_CAPTIONS` 环境变量在 shell 中不会传给 python 子进程
+**风险**：`EVENT_CAPTIONS=... bash xxx.sh` 形式不会自动导出，python 端拿到默认路径，静默退化为「无 caption」。
+**修复**：[`scripts/prepare_event_data.sh`](../prepare_event_data.sh) 调用 python 时显式带 `EVENT_CAPTIONS=... python ...`。
+
+#### P0-3 · 重复 import / reload 时 `_orig_lookup` 自我引用
+**风险**：测试中 `importlib.reload(convert_annotations_j)` 会让 `_orig_lookup` 指向已 patch 过的 J 版，调用时无限递归。
+**修复**：所有 patch（`lookup_events`、`build_system_prompt`、`N_KEYFRAMES_PER_EVENT`）都加 `_j_patched` 标记，幂等执行。
+
+### 🟠 中危（P1，已修复）
+
+#### P1-4 · `assert` 自检在 `-O` 优化模式下被跳过
+**风险**：`python -O` / `PYTHONOPTIMIZE=1` 会移除 assert，patch 链路损坏时不报错。
+**修复**：5 条自检改为显式 `if ... raise RuntimeError(...)`。
+
+#### P1-5 · `event_clip_path` 抄了 baseline 公共函数，未来易漂移
+**修复**：直接 `from convert_annotations import event_clip_rel_path` 复用。
+
+#### P1-6 · VLM 阶段 `clips_dir` 不存在时静默跳过
+**风险**：用户没跑 D 时 VLM 阶段会显示「所有事件均已有 caption」却什么都没干。
+**修复**：[`vlm_fill_missing`](generate_event_captions.py) 入口检查目录存在性，缺失时打 ERROR 并附操作建议。
+
+#### P1-7 · scene_metadata 重新切场后 caption 会错位
+**风险**：caption 按事件 id 索引，scene_metadata 变化（重新切场）后 event id 含义改变，caption 全部错位且无任何告警。
+**修复**：caption 文件写入 `_meta.scene_metadata_sha1`；加载时校验，不一致 → RuntimeError，强制用户重跑 caption。
+
+### 🟡 低危（P2，未修复，作为改进项）
+
+| ID | 问题 | 建议方案 |
+|---|---|---|
+| P1-8 | `events` 字段带 caption 写入 jsonl（每样本多 ~6KB）| 在 `convert_sft/rl_sample` 序列化前剥离 caption；需多包一层 wrapper |
+| P2-9 | `harvest` 多 sentence 拼接无长度上限 | harvest 阶段也截断到 200 字符 |
+| P2-10 | `OVERLAP_EPS=0.01s` 太松，邻居 sentence 会污染短事件 caption | 用 `min_overlap = 0.3 * min(event_dur, sentence_dur)` |
+| P2-12 | `IMAGE_LIMIT=32` 没覆盖 N>32 的视频 | 跑统计确认 max(N)，或在转换时预过滤 |
+| P2-13 | 7B + 30 张 image 显存压力 | 第一次跑 `bs=1 + zero3` 验证 |
+| P2-14 | `if not events: return events` 让 `None` 与 `[]` 同等处理 | 改为显式分支 |
+
+详细分析见 [`../annotation_analysis.md`](../annotation_analysis.md) 第 8.5 节末尾。

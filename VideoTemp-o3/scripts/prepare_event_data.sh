@@ -49,14 +49,20 @@ case "$PROMPT_STYLE" in
 esac
 
 # 方案 J 需要事件级 caption metadata，缺失时给出明确提示
-if [ "$PROMPT_STYLE" = "j" ] && [ ! -f "${EVENT_CAPTIONS:-scripts/plan_j/event_captions.json}" ]; then
-    echo "[WARN] event_captions.json 不存在: ${EVENT_CAPTIONS:-scripts/plan_j/event_captions.json}"
+if [ "$PROMPT_STYLE" = "j" ] && [ ! -f "$EVENT_CAPTIONS" ]; then
+    echo "[WARN] event_captions.json 不存在: $EVENT_CAPTIONS"
     echo "       所有事件 caption 将兜底为 '(no description)'。"
     echo "       建议先运行: python scripts/plan_j/generate_event_captions.py --mode auto ..."
 fi
 
 SFT_OUTPUT="sft/data_events${SUFFIX}"
 RL_OUTPUT="rl/data_events${SUFFIX}"
+
+# [P0-2] 方案 J 通过 EVENT_CAPTIONS 环境变量定位 caption 文件。
+# 显式 export 让所有后续 python 子进程都拿得到（避免 `KEY=val bash xxx.sh` 不透传的坑）
+if [ "$PROMPT_STYLE" = "j" ]; then
+    export EVENT_CAPTIONS="${EVENT_CAPTIONS:-scripts/plan_j/event_captions.json}"
+fi
 
 echo "============================================"
 echo "  事件定位版数据准备"

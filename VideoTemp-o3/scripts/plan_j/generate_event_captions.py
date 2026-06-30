@@ -25,10 +25,28 @@ from typing import Dict, List, Optional, Tuple
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# 共享 normalize 与覆盖判定（与 convert_annotations.py 对齐，避免 key 不一致）
+# 共享 normalize / OVERLAP / 路径函数（与 convert_annotations.py 对齐，避免漂移）
 _SCRIPTS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _SCRIPTS_DIR)
-from convert_annotations import normalize_rel_path, OVERLAP_EPS  # noqa: E402
+from convert_annotations import normalize_rel_path, OVERLAP_EPS, event_clip_rel_path  # noqa: E402
+
+# [P1-7] caption 文件中 _meta.scene_metadata_sha1 用于一致性校验
+import hashlib  # noqa: E402
+
+
+def _file_sha1(path: str) -> str:
+    h = hashlib.sha1()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+# [P0-1] caption 内特殊字符会破坏下游 system prompt 结构，统一清洗
+def _sanitize_caption(text: str) -> str:
+    if not text:
+        return ""
+    return text.replace("\n", " ").replace("\r", " ").replace('"', "'").strip()
 
 
 # ============================================================
@@ -36,17 +54,26 @@ from convert_annotations import normalize_rel_path, OVERLAP_EPS  # noqa: E402
 # ============================================================
 
 def load_existing(path: str) -> Dict[str, Dict[str, str]]:
+    """[P1-7] 加载已有 captions；剥离 _meta 字段，让调用方拿到纯 caption dict。"""
     if not os.path.exists(path):
         return {}
     with open(path) as f:
-        return json.load(f)
+        data = json.load(f)
+    if isinstance(data, dict):
+        data.pop("_meta", None)
+    return data
 
 
-def save_captions(path: str, data: Dict[str, Dict[str, str]]):
+def save_captions(path: str, data: Dict[str, Dict[str, str]], scene_meta_sha1: Optional[str] = None):
+    """[P1-7] 原子写入；可选附带 scene_metadata.sha1 作为一致性锚。"""
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    # 不污染调用方的 data dict：浅拷贝一层
+    payload = dict(data)
+    if scene_meta_sha1:
+        payload["_meta"] = {"scene_metadata_sha1": scene_meta_sha1, "version": 1}
     tmp = path + ".tmp"
     with open(tmp, 'w') as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+        json.dump(payload, f, ensure_ascii=False, indent=2)
     os.replace(tmp, path)
 
 
@@ -171,14 +198,16 @@ def harvest_captions(data_dirs: List[str], scene_metadata: Dict,
                 if ov > eps and s_text:
                     overlapping.append(s_text)
             if overlapping:
-                # 去重保序拼接，避免重复 sentence
+                # 去重保序拼接，避免重复 sentence；[P0-1] 拼接前先清洗
                 seen = set()
                 merged = []
                 for s_text in overlapping:
-                    if s_text not in seen:
-                        merged.append(s_text)
-                        seen.add(s_text)
-                event_caps[str(ev["event_id"])] = " ".join(merged)
+                    cleaned = _sanitize_caption(s_text)
+                    if cleaned and cleaned not in seen:
+                        merged.append(cleaned)
+                        seen.add(cleaned)
+                if merged:
+                    event_caps[str(ev["event_id"])] = " ".join(merged)
         if event_caps:
             result[vkey] = event_caps
             n_videos_covered += 1
@@ -250,48 +279,60 @@ class QwenVLCaptioner:
             return None
 
 
-def event_clip_path(video_rel_key: str, event_id: int, clips_dir: str) -> str:
-    """与 convert_annotations.event_clip_rel_path 的命名对齐。"""
-    safe = os.path.splitext(video_rel_key)[0].replace("/", "_").replace(os.sep, "_")
-    return os.path.join(clips_dir, safe, f"event_{event_id}.mp4")
-
-
 def vlm_fill_missing(scene_metadata: Dict, clips_dir: str,
                      existing: Dict[str, Dict[str, str]],
                      captioner: QwenVLCaptioner,
                      project_root: str, out_path: str,
-                     checkpoint_every: int = 1000) -> Dict[str, Dict[str, str]]:
-    """对缺失 caption 的事件用 VLM 补齐，增量保存。"""
+                     checkpoint_every: int = 1000,
+                     scene_meta_sha1: Optional[str] = None) -> Dict[str, Dict[str, str]]:
+    """对缺失 caption 的事件用 VLM 补齐，增量保存。
+
+    [P1-6] 入口检查 clips_dir 存在性，缺失时打 ERROR 并返回（不静默跳过）。
+    """
+    # [P1-6] clip 目录不存在 → 显式 ERROR
+    if not os.path.isdir(clips_dir):
+        logger.error(
+            f"[vlm] clips_dir 不存在: {clips_dir}\n"
+            f"  VLM 阶段无法运行。请先生成事件 clip:\n"
+            f"    PROMPT_STYLE=d bash scripts/prepare_event_data.sh    （推荐，复用 D 的产物）\n"
+            f"  或 baseline 也会产出 sft/data_events/event_clips/。"
+        )
+        return existing
+
     scene_norm = {normalize_rel_path(k, project_root): v for k, v in scene_metadata.items()}
     out = {k: dict(v) for k, v in existing.items()}
 
     pending: List[Tuple[str, int, str]] = []
+    n_clip_missing = 0
     for vkey, meta in scene_norm.items():
         for ev in meta.get("events", []):
             if str(ev["event_id"]) in out.get(vkey, {}):
                 continue
-            clip = event_clip_path(vkey, ev["event_id"], clips_dir)
+            # [P1-5] 复用 baseline 公共函数，避免命名规则漂移
+            clip = event_clip_rel_path(vkey, ev["event_id"], clips_dir)
             if not os.path.exists(clip):
-                logger.debug(f"[vlm] clip 不存在，跳过: {clip}")
+                n_clip_missing += 1
                 continue
             pending.append((vkey, ev["event_id"], clip))
 
     total = len(pending)
+    if n_clip_missing:
+        logger.warning(f"[vlm] 有 {n_clip_missing} 个事件 clip 不存在，将跳过其 caption 生成")
     if total == 0:
-        logger.info("[vlm] 所有事件均已有 caption，跳过 VLM 阶段")
+        logger.info("[vlm] 没有可补齐的事件（要么已全有 caption，要么 clip 全缺）")
         return out
     logger.info(f"[vlm] 待生成 caption 事件数: {total}")
 
     for i, (vkey, eid, clip) in enumerate(pending, 1):
         cap = captioner.caption(clip)
         if cap:
-            out.setdefault(vkey, {})[str(eid)] = cap
+            out.setdefault(vkey, {})[str(eid)] = _sanitize_caption(cap)
         if i % 50 == 0 or i == total:
             logger.info(f"[vlm] 进度 {i}/{total} ({100.0 * i / total:.1f}%)")
         if i % checkpoint_every == 0:
-            save_captions(out_path, out)
+            save_captions(out_path, out, scene_meta_sha1=scene_meta_sha1)
             logger.info(f"[vlm] checkpoint dump @ {i}")
-    save_captions(out_path, out)
+    save_captions(out_path, out, scene_meta_sha1=scene_meta_sha1)
     logger.info(f"[vlm] 完成，共生成 {total} 条 caption")
     return out
 
@@ -324,6 +365,10 @@ def main():
         scene_metadata = json.load(f)
     logger.info(f"已加载 {len(scene_metadata)} 视频的 scene_metadata")
 
+    # [P1-7] 计算 scene_metadata SHA1，写入 caption 文件用于下游一致性校验
+    scene_meta_sha1 = _file_sha1(args.scene_metadata)
+    logger.info(f"scene_metadata.sha1 = {scene_meta_sha1[:12]}...")
+
     existing = load_existing(args.output)
     if existing:
         n_ev = sum(len(v) for v in existing.values())
@@ -337,7 +382,7 @@ def main():
             target = existing.setdefault(vkey, {})
             for eid, cap in ev_caps.items():
                 target.setdefault(eid, cap)
-        save_captions(args.output, existing)
+        save_captions(args.output, existing, scene_meta_sha1=scene_meta_sha1)
         logger.info(f"[harvest] 已保存 → {args.output}")
 
     # Stage 2: VLM
@@ -353,6 +398,7 @@ def main():
             existing = vlm_fill_missing(
                 scene_metadata, args.clips_dir, existing, captioner,
                 project_root, args.output, args.checkpoint_every,
+                scene_meta_sha1=scene_meta_sha1,
             )
 
     # 终态统计
