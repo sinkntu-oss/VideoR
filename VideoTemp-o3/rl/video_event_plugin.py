@@ -197,7 +197,9 @@ class EventLocatingScheduler(MultiTurnScheduler):
                 pass
         if not src:
             vids = getattr(infer_request, 'videos', None) or []
-            return vids[0] if vids else None
+            if not vids:
+                return None
+            src = vids[0]
         return src if os.path.isabs(src) else os.path.abspath(src)
 
     def check_finished(self, infer_request, response_choice, current_turn) -> bool:

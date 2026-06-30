@@ -26,12 +26,14 @@ case "$PROMPT_STYLE" in
 esac
 
 VIDEO_LIMIT="${VIDEO_LIMIT:-10}"
-MODEL="${MODEL:-sft/ckpt/test}"
+# 默认指向同 PROMPT_STYLE 的 SFT 输出目录；多 checkpoint 时请通过 MODEL=... 显式指定到具体 checkpoint-xxx 子目录
+MODEL="${MODEL:-sft/ckpt/test_events_${PROMPT_STYLE}}"
 
 echo "============================================"
 echo "  Rollout  PROMPT_STYLE=$PROMPT_STYLE"
 echo "  起点模型: $MODEL"
 echo "  image 限制: $IMAGE_LIMIT, video 限制: $VIDEO_LIMIT"
+echo "  (如需指定具体 checkpoint，请用 MODEL=sft/ckpt/test_events_${PROMPT_STYLE}/checkpoint-xxx bash rl/rollout_events.sh)"
 echo "============================================"
 
 # Image 像素参数（方案 D 必需；其他方案无 <image> 输入时无影响）
