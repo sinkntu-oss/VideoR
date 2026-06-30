@@ -3,12 +3,13 @@
 # 事件定位版 GRPO 训练启动脚本
 # 使用 video_event_plugin.py 和 event_reward 替代原有版本
 #
-# 支持 5 套 prompt 风格（通过 PROMPT_STYLE 环境变量选择）：
+# 支持 6 套 prompt 风格（通过 PROMPT_STYLE 环境变量选择）：
 #   baseline (默认) - 数据集: rl/data_events/
 #   b               - 数据集: rl/data_events_b/
 #   c               - 数据集: rl/data_events_c/
 #   d               - 数据集: rl/data_events_d/   (关键帧版)
 #   e               - 数据集: rl/data_events_e/
+#   j               - 数据集: rl/data_events_j/   (caption + 1 关键帧/事件)
 #
 # 使用:
 #   bash rl/grpo_events.sh                  # baseline
@@ -23,7 +24,8 @@ case "$PROMPT_STYLE" in
     c)        DATA_DIR="rl/data_events_c" ;;
     d)        DATA_DIR="rl/data_events_d" ;;
     e)        DATA_DIR="rl/data_events_e" ;;
-    *) echo "[ERROR] Unknown PROMPT_STYLE: $PROMPT_STYLE (expected: baseline|b|c|d|e)" >&2; exit 1 ;;
+    j)        DATA_DIR="rl/data_events_j" ;;
+    *) echo "[ERROR] Unknown PROMPT_STYLE: $PROMPT_STYLE (expected: baseline|b|c|d|e|j)" >&2; exit 1 ;;
 esac
 
 OUTPUT_DIR="${OUTPUT_DIR:-rl/ckpt/test_events_${PROMPT_STYLE}}"
@@ -38,7 +40,7 @@ echo "  输出目录: $OUTPUT_DIR"
 echo "  (如需指定具体 checkpoint，请用 MODEL=sft/ckpt/test_events_${PROMPT_STYLE}/checkpoint-xxx bash rl/grpo_events.sh)"
 echo "============================================"
 
-# Image 像素参数（方案 D 必需；其他方案无 <image> 输入时无影响）
+# Image 像素参数（方案 D / J 必需；其他方案无 <image> 输入时无影响）
 MAX_PIXELS="${MAX_PIXELS:-501760}"
 MIN_PIXELS="${MIN_PIXELS:-50176}"
 

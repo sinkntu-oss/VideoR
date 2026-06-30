@@ -2,12 +2,14 @@
 # ============================================================
 # 一键生成事件定位版训练数据
 #
-# 支持 5 套 prompt 风格（通过 PROMPT_STYLE 环境变量选择）：
-#   baseline (默认) - convert_annotations.py        → sft/data_events    & rl/data_events
-#   b               - convert_annotations_b.py      → sft/data_events_b  & rl/data_events_b
-#   c               - convert_annotations_c.py      → sft/data_events_c  & rl/data_events_c
-#   d               - convert_annotations_d.py      → sft/data_events_d  & rl/data_events_d (关键帧版)
-#   e               - convert_annotations_e.py      → sft/data_events_e  & rl/data_events_e
+# 支持 6 套 prompt 风格（通过 PROMPT_STYLE 环境变量选择）：
+#   baseline (默认) - convert_annotations.py                  → sft/data_events    & rl/data_events
+#   b               - convert_annotations_b.py                → sft/data_events_b  & rl/data_events_b
+#   c               - convert_annotations_c.py                → sft/data_events_c  & rl/data_events_c
+#   d               - convert_annotations_d.py                → sft/data_events_d  & rl/data_events_d (关键帧版)
+#   e               - convert_annotations_e.py                → sft/data_events_e  & rl/data_events_e
+#   j               - plan_j/convert_annotations_j.py         → sft/data_events_j  & rl/data_events_j (caption + 1 关键帧)
+#                     需先运行: python scripts/plan_j/generate_event_captions.py
 #
 # 使用方法:
 #   cd VideoR/VideoTemp-o3
@@ -37,13 +39,21 @@ PROMPT_STYLE="${PROMPT_STYLE:-baseline}"
 
 # Prompt 风格 → 转换脚本 + 输出目录后缀
 case "$PROMPT_STYLE" in
-    baseline) CONVERT_SCRIPT="scripts/convert_annotations.py";   SUFFIX="" ;;
-    b)        CONVERT_SCRIPT="scripts/convert_annotations_b.py"; SUFFIX="_b" ;;
-    c)        CONVERT_SCRIPT="scripts/convert_annotations_c.py"; SUFFIX="_c" ;;
-    d)        CONVERT_SCRIPT="scripts/convert_annotations_d.py"; SUFFIX="_d" ;;
-    e)        CONVERT_SCRIPT="scripts/convert_annotations_e.py"; SUFFIX="_e" ;;
-    *) echo "[ERROR] Unknown PROMPT_STYLE: $PROMPT_STYLE (expected: baseline|b|c|d|e)" >&2; exit 1 ;;
+    baseline) CONVERT_SCRIPT="scripts/convert_annotations.py";          SUFFIX="" ;;
+    b)        CONVERT_SCRIPT="scripts/convert_annotations_b.py";        SUFFIX="_b" ;;
+    c)        CONVERT_SCRIPT="scripts/convert_annotations_c.py";        SUFFIX="_c" ;;
+    d)        CONVERT_SCRIPT="scripts/convert_annotations_d.py";        SUFFIX="_d" ;;
+    e)        CONVERT_SCRIPT="scripts/convert_annotations_e.py";        SUFFIX="_e" ;;
+    j)        CONVERT_SCRIPT="scripts/plan_j/convert_annotations_j.py"; SUFFIX="_j" ;;
+    *) echo "[ERROR] Unknown PROMPT_STYLE: $PROMPT_STYLE (expected: baseline|b|c|d|e|j)" >&2; exit 1 ;;
 esac
+
+# 方案 J 需要事件级 caption metadata，缺失时给出明确提示
+if [ "$PROMPT_STYLE" = "j" ] && [ ! -f "${EVENT_CAPTIONS:-scripts/plan_j/event_captions.json}" ]; then
+    echo "[WARN] event_captions.json 不存在: ${EVENT_CAPTIONS:-scripts/plan_j/event_captions.json}"
+    echo "       所有事件 caption 将兜底为 '(no description)'。"
+    echo "       建议先运行: python scripts/plan_j/generate_event_captions.py --mode auto ..."
+fi
 
 SFT_OUTPUT="sft/data_events${SUFFIX}"
 RL_OUTPUT="rl/data_events${SUFFIX}"

@@ -540,7 +540,308 @@ PROMPT_STYLE=d MODEL=sft/ckpt/test_events_d/checkpoint-xxx bash rl/grpo_events.s
 
 ---
 
-## 8. 文件清单
+## 8. 未来优化方向：粗采样信息丢失问题
+
+### 8.1 问题本质：粗采样的不可逆性
+
+baseline / B / C / E 四套方案第一步都是「整段原视频」，由 ms-swift / Qwen2.5-VL VideoProcessor 在线采样。受环境变量约束（[`sft/sft_events.sh:45-50`](../sft/sft_events.sh:45-50) 与 [`rl/rollout_events.sh:41-46`](../rl/rollout_events.sh:41-46)）：
+
+```bash
+FPS_MAX_FRAMES=512        # 单视频最多 512 帧
+fps=2 (Qwen2.5-VL 默认)   # 等距抽帧
+VIDEO_MIN/MAX_PIXELS=50176  # 每帧 ≈ 224×224
+```
+
+采样公式：`nframes = floor(min(duration×fps, FPS_MAX_FRAMES, total_frames) / 2) × 2`
+
+→ 长视频会被截断到 512 帧。例如 10 分钟视频 → **每 ~7s 才采 1 帧**。
+
+**致命链路**：
+
+```
+原视频 18000 帧 ──采样到 512 帧──▶ 模型 Turn 1 看到稀疏帧
+                                          │
+                                          ▼
+                  ┌─ 看到了的事件 → 可能发 locate_events 工具调用
+                  └─ 没看到的事件 → 永远不会被选中（盲区不可见 → 不会被探测）
+```
+
+`locate_events` 工具只能**放大已看到的细节**，无法挽回 Turn 1 完全没看到的内容。**System prompt 里只有事件时间列表**（如 `Event 5: 30s-45s`）→ 纯文本元数据无法补偿视觉缺失，模型不知道 Event 5 里发生了什么，也就不知道值不值得 locate。
+
+### 8.2 5 种优化方向（按改动成本排序）
+
+| 方向 | 思路 | 改动量 | Token 额外开销 | 是否结构性消除盲区 |
+|------|------|--------|----------------|---------------------|
+| **方案 F**（修改 prompt） | 明确告知模型采样稀疏，鼓励主动 tool 调用 | 5 行 prompt | ~50 tokens | ❌ 行为引导而非结构修复 |
+| **方案 G**（事件缩略图锚点） | 主视频 + 每事件 1 张代表帧（D 的非破坏版本） | 1 个新转换脚本 (~30 行) | N×64 tokens (~1k) | ✅ 完全消除 |
+| **方案 H**（自适应关键节点） | 复用 CLIP CLS 计算抽出 top-K 高变化点帧 | 改 preprocess + 新转换脚本 | K×64 tokens (~2k) | ✅ 概率性消除 |
+| **方案 J**（事件级 caption + 代表帧） | 离线 VLM 为每事件生成 1 句 caption，与代表帧一并嵌入 system prompt | 1 个 captioner 脚本 + 1 个转换脚本 | N×64 + N×30 (~2k) | ✅ 完全消除（图+文双通道） |
+| **方案 I**（两阶段 zoom） | 拆 `locate_events` 为 `coarse_zoom` + `fine_zoom` 渐进细化 | 重构 plugin + reward | 视轮次而定 | ✅ 主动探测，理论最优 |
+
+### 8.3 方案 F — 视觉盲区提示词增强（最低成本，作为所有方案的通用补丁）
+
+> **核心思想**：让模型知道自己的视觉局限，把"应该调用工具"的判断显式内化到 prompt 中。即使盲区客观存在，至少让模型对每个未被强证据覆盖的事件**默认怀疑**，提高 tool 调用率。
+
+**两条独立改造**（可叠加）：
+
+#### F1：在 system prompt 中明示采样稀疏性
+
+baseline 当前 prompt（[`convert_annotations.py:38-51`](convert_annotations.py:38-51)）只描述了"视频已切成事件"，没有任何关于**采样稀疏**的提示。建议在事件列表后追加：
+
+```
+IMPORTANT: The video is sampled at low frame rate. Brief events (especially those
+shorter than a few seconds) may be poorly represented or invisible in your initial
+view. If you cannot confidently answer the question from the sampled frames alone,
+or if you suspect important details in any specific event, you SHOULD use
+locate_events to retrieve full clips before answering.
+```
+
+预期效果：在 RL 训练中，配合 [`Event_Reward`](../rl/video_event_plugin.py:339-353) 的 F1 信号，鼓励模型形成「不确定 → 调用」的决策习惯，而非「文本元数据足够 → 直接答」的捷径。
+
+#### F2：在 tool 失败/未用时给出反馈式 user 提示
+
+当模型 Turn 1 直接给 `<answer>` 而未调用 tool 时，当前不会有任何反馈。可考虑在 RL rollout 阶段，对**低置信度场景**（如答案中含 "maybe"、"unclear"、"I think" 等）追加一轮 user 提示：
+
+```
+You answered without examining specific events in detail. If you are uncertain,
+you may use locate_events to retrieve close-up clips for events that might
+contain the key information, then revise your answer.
+```
+
+这条更复杂（需要置信度检测），属于第二阶段优化。
+
+#### F3：每个事件附带"信息密度提示"（依赖方案 H）
+
+如果做了方案 H（自适应关键节点检测），可以把 CLIP 相似度方差作为「事件复杂度」指标暴露给模型：
+
+```
+The video has been segmented into the following events:
+  Event 0: 0.0s - 3.2s   [low visual variation]
+  Event 1: 3.2s - 27.8s  [HIGH visual variation — likely contains multiple sub-actions]
+  Event 2: 27.8s - 30.1s [low visual variation]
+  ...
+```
+
+让模型优先聚焦高复杂度事件 → tool 调用更有针对性。
+
+### 8.4 方案 F 的实施路径
+
+**复用现有 monkey-patch 模式**，新建 [`scripts/convert_annotations_f.py`](convert_annotations_f.py)：
+
+```python
+import convert_annotations as _ca
+
+SYSTEM_PROMPT_TEMPLATE_F = _ca.SYSTEM_PROMPT_TEMPLATE.replace(
+    "Use the insights from the selected event clips ",
+    """IMPORTANT: The video is sampled at low frame rate. Brief events may be poorly
+represented or invisible in your initial view. If you cannot confidently answer the
+question from the sampled frames alone, you SHOULD use locate_events to retrieve
+full clips before answering.
+
+Use the insights from the selected event clips """
+)
+
+def build_system_prompt(events):
+    return SYSTEM_PROMPT_TEMPLATE_F.format(event_list=...)  # 同 baseline
+
+_ca.build_system_prompt = build_system_prompt
+
+if __name__ == "__main__":
+    _ca.main()
+```
+
+**训练侧零改动**：复用现有 [`prepare_event_data.sh`](prepare_event_data.sh) / [`sft_events.sh`](../sft/sft_events.sh) / [`grpo_events.sh`](../rl/grpo_events.sh)，只需在它们的 `case "$PROMPT_STYLE"` 分发表中追加 `f) ...` 分支即可。
+
+**实验对照**：
+
+| 实验组 | PROMPT_STYLE | 验证假设 |
+|--------|--------------|---------|
+| Baseline | `baseline` | 当前基线 |
+| F | `f` | 仅加视觉盲区提示，验证「提示词引导」的纯增益 |
+| D | `d` | 取消主视频改 keyframe，验证「结构性消除盲区」的纯增益 |
+| D+F | `d` 数据 + F 的 prompt | 是否能进一步叠加（理论上 D 已无盲区，F 收益应趋于 0） |
+
+**核心指标**：
+- 第一轮就给 `<answer>` 的样本比例（应下降）
+- 平均 tool 调用次数（应上升但不过度）
+- 答案准确率 / Event F1（应上升）
+- 短事件（< 5s）相关问题的准确率（**该方向最敏感的指标**）
+
+### 8.5 方案 J — 事件粒度离线 caption + 视觉锚点
+
+> **核心思想**：把"模型自己从稀疏视频帧里盲猜"改成"模型读 N 句 caption + 看 N 张代表帧主动决策"。
+> 离线一次性预处理生成 caption + keyframe，**训练和推理共享同一份 metadata**，运行时零额外成本。
+
+#### 8.5.1 与方案 G 的关系
+
+J 是 **G 的文本增强版**：样本结构基本一致（主视频 + N 张代表帧），唯一差别在 system prompt 文本：
+
+```
+G:  Event 0: 0.0s - 12.3s [see image 0]
+J:  Event 0 (0.0s-12.3s): "A man walks into a wooden room and turns on the light." [image 0]
+```
+
+模型决策路径从「看图判断」升级为「**看图 + 读 caption 双通道判断**」。caption 提供快速文本过滤：
+- 问题问"开门动作" → 模型读 caption 直接锁定 Event 0、Event 2，跳过其他事件的视觉详查
+- 问题问"红色物体" → caption 没提颜色 → 模型才需要走 `locate_events` 看视觉
+
+#### 8.5.2 离线 pipeline（与方案 D 高度复用）
+
+```
+[一次性离线预处理]
+原视频
+  ↓ Step 1: preprocess_scenes.py        (CLIP CLS 切场，已有)
+  ↓ Step 2: convert_annotations_d.py    (抽 event_clips/*.mp4 + 代表帧，已有)
+  ↓ Step 3: ⭐ generate_event_captions.py (新增：VLM 读 clip → 1 句 caption → 写入 metadata)
+  ↓ Step 4: convert_annotations_j.py    (新增：组装样本，把 caption 嵌入 system prompt)
+sft/data_events_j/  +  scripts/event_captions.json
+```
+
+**关键性质**：
+- **训练集 + 测试集 + 部署场景** 都用同一份 `event_captions.json` → **零 train-test mismatch**
+- **运行时不需要 captioner**：metadata 写死，推理 0 额外延迟
+- **与方案 D 流水线天然耦合**：Step 3 输入就是 D 的 `event_clips/*.mp4`，多一道 VLM forward 即可
+
+#### 8.5.3 Captioner 选型与成本估算
+
+假设规模：5 万视频 × 平均 8 事件 = **40 万次 caption 调用**。
+
+| Captioner | 单 clip 时间 | 8×A100 总时长 |
+|-----------|--------------|----------------|
+| Qwen2.5-VL-7B（自洽，与训练模型一致） | ~3-5s | ~200 GPU·h |
+| Qwen2.5-VL-3B | ~1-2s | ~80 GPU·h |
+| InternVL2-2B / SmolVLM-2.2B | ~0.5-1s | ~40 GPU·h |
+
+**一次性投入，永久使用**。最便宜方案 ~5 小时跑批完毕。
+
+#### 8.5.4 「白嫖」捷径：复用现成数据集 caption
+
+部分数据集本身就携带事件级 caption，可**零 GPU 成本**注入：
+
+| 数据集 | 是否含事件级 caption | 字段 |
+|--------|---------------------|------|
+| ActivityNet Captions | ✅ | `sentences` (与 `timestamps` 对齐) |
+| VidChapters-7M | ✅ | `chapter_titles` |
+| LongVila | ⚠️ 看版本 | — |
+| Charades / QVHighlights / Video-R1 | ❌ | — |
+
+在 [`scripts/preprocess_scenes.py`](preprocess_scenes.py) 输出 metadata 时按时间戳对齐：
+
+```python
+for ev in events:
+    overlapping = [
+        s for s, (st, et) in zip(orig_sentences, orig_timestamps)
+        if min(et, ev["end_time"]) - max(st, ev["start_time"]) > 0.5
+    ]
+    ev["caption"] = " ".join(overlapping) or None  # None → 后续由 VLM 补
+```
+
+**推荐两步走**：先白嫖 ActivityNet/VidChapters 的 caption 看效果；如果有显著收益，再投资 VLM 补齐 Charades 等没 caption 的数据集。
+
+#### 8.5.5 实施路径
+
+新增两个脚本：
+
+**1) [`scripts/generate_event_captions.py`](generate_event_captions.py)**（待实现）
+
+```python
+# 输入：sft/data_events_d/event_clips/<safe>/event_X.mp4 (或代表帧)
+# 输出：event_captions.json = { "<safe>/event_X": "A man opens a door." }
+# 实现：
+#   - 加载 captioner（Qwen2.5-VL-3B / SmolVLM）
+#   - 遍历所有 event clip，每条采 4-8 帧调 captioner
+#   - prompt: "Describe what happens in this short video clip in one sentence."
+#   - 控制输出长度（max_new_tokens=40），过滤空输出
+#   - 增量保存：每 1000 条 dump 一次，断点续跑
+```
+
+**2) [`scripts/convert_annotations_j.py`](convert_annotations_j.py)**（待实现）
+
+```python
+import convert_annotations as _ca
+import json
+
+with open("scripts/event_captions.json") as f:
+    CAPTIONS = json.load(f)
+
+SYSTEM_PROMPT_TEMPLATE_J = """You are a helpful assistant.
+...
+The video has been segmented into the following events (each with a brief
+description and a representative frame):
+{event_list}
+
+If you need to examine specific events more closely, use:
+<tool_call>{{"name":"locate_events","arguments":{{"event_ids":[...]}}}}</tool_call>
+"""
+
+def build_system_prompt(events, video_key):
+    lines = []
+    for i, e in enumerate(events):
+        cap = CAPTIONS.get(f"{video_key}/event_{e['event_id']}", "(no description)")
+        lines.append(f"  Event {e['event_id']} ({e['start_time']:.1f}s-{e['end_time']:.1f}s): \"{cap}\" [image {i}]")
+    return SYSTEM_PROMPT_TEMPLATE_J.format(event_list="\n".join(lines))
+
+# 视觉部分：直接复用方案 G 的「主视频 + 每事件 1 张代表帧」改造
+# (或基于方案 D 的 keyframe 抽取，N_KEYFRAMES_PER_EVENT=1)
+...
+```
+
+**训练侧改动**：4 个 shell 脚本的 `case "$PROMPT_STYLE"` 分发表追加 `j) ...` 分支，与方案 D 类似（需要 image 像素参数）。
+
+#### 8.5.6 风险与缓解
+
+| 风险 | 缓解 |
+|------|------|
+| **VLM caption 幻觉污染训练信号** | (1) 用 Qwen2.5-VL-3B+ 而非 2B 小模型；(2) 抽样 100 条人工质检；(3) caption 模板严格限定"Describe what is visible"避免推断 |
+| **caption 长度膨胀挤占视觉 token** | 限制 max_new_tokens=40，平均 ~20-30 tokens/事件，30 事件总开销 ~900 tokens（可接受） |
+| **caption 跟问题语义不对齐** | 这是 caption 通用性的固有问题；缓解：先用通用 caption；若效果不足再用 question-conditioned caption（推理时根据问题二次生成，但破坏离线一致性，不推荐） |
+| **离线 caption 跟训练时模型理解的不对齐** | 推荐用与训练模型同源的 captioner（Qwen2.5-VL-3B → 训练 Qwen2.5-VL-7B），减少语义偏移 |
+
+#### 8.5.7 与已有方案的可实施性对比
+
+| 维度 | F | G | **J** | D | H | I |
+|------|---|---|-------|---|---|---|
+| 离线投入 | 0 | 秒级 | **40-200 GPU·h（一次性）** | 同 D 抽帧 | CLIP 已有 | 0 |
+| 与 D 流水线复用 | 无 | 高 | **极高（直接复用 event_clip）** | — | 高 | 无 |
+| 训练-推理一致性 | ✅ | ✅ | ✅（离线 metadata 写死） | ✅ | ✅ | ✅ |
+| 部署侧改动 | 0 | 0 | **0**（不需要部署 captioner） | 0 | 0 | reward 重构 |
+| 结构性消除盲区 | ❌ | ✅ | ✅+文本通道 | ✅ | ✅ | ✅ |
+
+**结论**：方案 J 是「**G 的能力上限版**」—— 在 G 已经消除视觉盲区的基础上，再加一个**文本快速过滤通道**，让 tool 调用决策更精准。离线投入比 G 大一个量级，但运行时与 G 等价。
+
+---
+
+### 8.6 推荐落地顺序
+
+```
+F (提示词)              → 半小时
+  ↓
+G (主视频 + 代表帧)      → 1 天
+  ↓
+J-lite (G + 白嫖 caption) → 1-2 天 (只跑 ActivityNet/VidChapters 子集)
+  ↓
+J 完整 (J-lite + VLM 补齐其他数据集) → 1 周（含 captioner 跑批）
+  ↓
+H (自适应关键节点)        → 2 周（如果 J 仍有盲点）
+  ↓
+I (两阶段 zoom)          → 3-4 周（远期架构升级）
+```
+
+**5 组对照实验设计**（推荐先做这一组完整 A/B）：
+
+| 实验组 | 增量 | 验证假设 |
+|--------|------|---------|
+| baseline | — | 当前基线 |
+| F | 仅 prompt 警告 | 「提示词引导」纯增益 |
+| G | F + 每事件 1 张代表帧 | 「视觉锚点消除盲区」纯增益 |
+| J-lite | G + 白嫖 caption（部分数据） | 「文本目录通道」纯增益 |
+| D | 取消主视频改 keyframe | 「全 keyframe」与 G 比，主视频是否必要 |
+
+通过这 5 组可精确归因：prompt 帮的忙、图帮的忙、文本 caption 帮的忙、是否还要保留主视频。
+
+---
+
+## 9. 文件清单
 
 | 文件 | 说明 |
 |------|------|
@@ -549,4 +850,8 @@ PROMPT_STYLE=d MODEL=sft/ckpt/test_events_d/checkpoint-xxx bash rl/grpo_events.s
 | [`convert_annotations_c.py`](convert_annotations_c.py) | 方案 C：剥离时间戳 |
 | [`convert_annotations_d.py`](convert_annotations_d.py) | 方案 D：视觉锚点 |
 | [`convert_annotations_e.py`](convert_annotations_e.py) | 方案 E：原生 tools schema |
+| [`convert_annotations_f.py`](convert_annotations_f.py) | 方案 F：视觉盲区提示词增强（待实现） |
+| [`convert_annotations_j.py`](convert_annotations_j.py) | 方案 J：事件级 caption + 代表帧（待实现） |
+| [`generate_event_captions.py`](generate_event_captions.py) | 方案 J 的离线 caption 生成脚本（待实现） |
+| [`event_captions.json`](event_captions.json) | 方案 J 的 caption 元数据（待生成） |
 | [`annotation_analysis.md`](annotation_analysis.md) | 本文档 |
