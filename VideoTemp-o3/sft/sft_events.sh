@@ -76,6 +76,20 @@ if [ ${#MISSING[@]} -gt 0 ]; then
 fi
 echo "[OK] 数据集文件校验通过（${#DATASET_FILES[@]} 个 jsonl 全部就绪）"
 
+# [问题 3] D / J 关键帧版：在训练启动前做 chat template 冒烟测试，
+#         确认 ms-swift 真的会消费 jsonl 顶层 images 字段（而不是静默丢弃）。
+#         若失败，直接退出，避免训完才发现模型完全没看到关键帧。
+if [[ "$PROMPT_STYLE" == "d" || "$PROMPT_STYLE" == "j" ]]; then
+    if [ -f "scripts/plan_j/verify_sft_template.py" ]; then
+        echo "[问题 3] 运行 SFT chat template 冒烟测试..."
+        python scripts/plan_j/verify_sft_template.py "$DATA_DIR" --n_samples 3 || {
+            echo "[ERROR] chat template 冒烟测试失败：ms-swift 未正确消费 images 字段" >&2
+            echo "[ERROR] 详细原因见上方日志；不要启动训练。" >&2
+            exit 1
+        }
+    fi
+fi
+
 swift sft \
     --model /mnt/tidal-alsh01/dataset/redone/checkpoints/opensource/Qwen2.5-VL-7B-Instruct \
     --model_type qwen2_5_vl \

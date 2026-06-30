@@ -178,6 +178,21 @@ class EventLocatingScheduler(MultiTurnScheduler):
                   for m in EVENT_LINE_PAT.finditer(messages[0].get("content", ""))]
         return events or None
 
+    # [问题 4] 字段命中来源追踪：每种来源仅首次记录一次 logger.info，
+    #         便于运维确认 ms-swift 实际把 jsonl 顶层字段挂在了哪里
+    #         （属性 / data_dict / dict-like / 文本兜底）
+    _events_hit_logged = set()
+    _src_hit_logged = set()
+
+    @classmethod
+    def _log_hit(cls, field: str, source: str, hit_set: set) -> None:
+        if source not in hit_set:
+            hit_set.add(source)
+            logger.info(
+                f"[ms-swift field probe] {field} 字段命中来源 = {source} "
+                f"（首次记录；后续命中相同来源不再打印）"
+            )
+
     def _get_events(self, infer_request) -> Optional[List[Dict]]:
         """获取事件列表：优先样本元数据 → 兜底 system 文本 regex。
 
@@ -189,18 +204,28 @@ class EventLocatingScheduler(MultiTurnScheduler):
           2. infer_request.data_dict       （dict 字段）
           3. infer_request[...]            （dict-like）
           4. system 文本 regex             （baseline 兜底，行为不变）
+
+        [问题 4] 每种来源首次命中时打 logger.info，便于运维定位
+        ms-swift 实际把 jsonl 顶层 `events` 字段挂在了哪里。
         """
         raw = getattr(infer_request, 'events', None)
+        if raw:
+            self._log_hit('events', 'attr', self._events_hit_logged)
         if not raw:
             dd = getattr(infer_request, 'data_dict', None)
             if isinstance(dd, dict):
                 raw = dd.get('events')
+                if raw:
+                    self._log_hit('events', 'data_dict', self._events_hit_logged)
         if not raw:
             try:
                 raw = infer_request['events']  # type: ignore[index]
+                if raw:
+                    self._log_hit('events', 'dict_like', self._events_hit_logged)
             except (TypeError, KeyError, AttributeError):
                 pass
         if not raw:
+            self._log_hit('events', 'system_text_fallback', self._events_hit_logged)
             return self._parse_events_from_system_text(getattr(infer_request, 'messages', None))
 
         try:
@@ -235,17 +260,25 @@ class EventLocatingScheduler(MultiTurnScheduler):
         [H3] 全部 fallback 失败时 logger.error 让运维能定位（不再静默返回 None）。
         """
         src = getattr(infer_request, 'source_video', None)
+        if src:
+            self._log_hit('source_video', 'attr', self._src_hit_logged)
         if not src:
             dd = getattr(infer_request, 'data_dict', None)
             if isinstance(dd, dict):
                 src = dd.get('source_video')
+                if src:
+                    self._log_hit('source_video', 'data_dict', self._src_hit_logged)
         if not src:
             try:
                 src = infer_request['source_video']  # type: ignore[index]
+                if src:
+                    self._log_hit('source_video', 'dict_like', self._src_hit_logged)
             except (TypeError, KeyError, AttributeError):
                 pass
         if not src:
             vids = getattr(infer_request, 'videos', None) or []
+            if vids:
+                self._log_hit('source_video', 'videos[0]_fallback', self._src_hit_logged)
             if not vids:
                 if not EventLocatingScheduler._missing_src_warned:
                     logger.error(

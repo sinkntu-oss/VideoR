@@ -245,3 +245,132 @@ python scripts/plan_j/verify_fields.py rl/data_events_j --check_files 20
 ### 4. 磁盘报警
 - `rl/temp_videos/` 仍持续增长 → 检查 `EVENT_TEMP_CLIPS_CLEANUP_HOURS` 是否被设为 0
 - 紧急清理：`rm -rf rl/temp_videos/*` 不影响正在跑的 trajectory（裁剪是流式的）
+
+---
+
+## 第二轮端到端审计发现（数据 → SFT → RL → 评估）
+
+本节记录第二轮深度审计（覆盖原始数据 → 预处理 → SFT 训练 → RL rollout
+→ GRPO 训练 → 评估）发现的 11 个问题、人工核实结论与修复方案。
+
+### 🔴 真实高危（已修复）
+
+#### 问题 2/11：评估脚本硬编码 baseline prompt，D/J 评估完全失配
+**位置**：[`eval/videotemp/videotemp.py`](../eval/videotemp/videotemp.py) +
+[`eval/videotemp/videotemp-g.py`](../eval/videotemp/videotemp-g.py) +
+[`eval/utils.py`](../eval/utils.py:31-41)
+
+**问题**：`eval/utils.py` 的 `PREFIX_PROMPT` 写死 baseline 的 `get_video_clip_frame`
+工具协议，所有 benchmark 评估都用它。D / J 训出的模型用 `locate_events`
++ 关键帧/caption，prompt 失配，分数虚低不可信，方案对比失效。
+
+**修复**：[`eval/utils.py`](../eval/utils.py) 重构为 PROMPT_STYLE 分发：
+- `baseline` / `B` / `C` / `E` 走原 `get_video_clip_frame` 流程（默认）
+- `D` / `J` 走新 `_run_agent_event_style`：加载 `scene_metadata.json`、
+  按事件抽 K=2 或 1 张关键帧、构造对应 system prompt、用 `locate_events`
+  工具裁剪
+- 视频未在 metadata 中时 warning + 自动退回 baseline（不静默失败）
+- `EVAL_EVENT_TOOL=1` 可让 B/C/E 也走事件分支
+- 新增环境变量：`EVAL_SCENE_METADATA`、`EVAL_EVENT_CAPTIONS`、`EVAL_KEYFRAME_DIR`
+- 兼容历史：未设 `PROMPT_STYLE` 时行为不变；旧代码 `from utils import PREFIX_PROMPT` 仍可用
+
+**使用**：
+```bash
+# baseline 评估（与历史完全一致）
+python eval/videotemp/videotemp.py
+
+# D 方案评估（关键帧）
+PROMPT_STYLE=d EVAL_SCENE_METADATA=scripts/scene_metadata.json \
+    python eval/videotemp/videotemp.py
+
+# J 方案评估（关键帧 + caption）
+PROMPT_STYLE=j EVAL_SCENE_METADATA=scripts/scene_metadata.json \
+    EVAL_EVENT_CAPTIONS=scripts/plan_j/event_captions.json \
+    python eval/videotemp/videotemp.py
+```
+
+#### 问题 3：SFT 中 D/J 的 `images` 字段在 ms-swift 内部可能被静默丢弃
+**位置**：[`sft/sft_events.sh`](../sft/sft_events.sh)
+
+**问题**：[`scripts/plan_j/verify_fields.py`](../scripts/plan_j/verify_fields.py)
+只能校验 jsonl 写入正确（标签对齐、文件存在），但**无法保证** ms-swift 加载后
+chat template 真的把 `images` 传给 Qwen2.5-VL 的 vision encoder。这是 D/J
+训练的关键不确定性。
+
+**修复**：新增
+[`scripts/plan_j/verify_sft_template.py`](../scripts/plan_j/verify_sft_template.py)
+SFT chat template 冒烟测试：
+- 加载 N 条含 `images` 字段的样本
+- 走 `swift.llm.get_template(...).encode(sample)` 真实渲染流水
+- 校验：input_ids 中 image_token (`<|image_pad|>`) 实际出现次数 > 0
+- 校验：`pixel_values` / `images` 输出存在
+- 任一不通过 exit 1
+
+`sft/sft_events.sh` 在 D/J 启动前自动跑该冒烟测试，失败立刻 exit 1，
+避免训完才发现模型完全没看到关键帧。
+
+#### 问题 4：GRPO `vllm_server_pass_dataset true` 字段透传链路不可见
+**位置**：[`rl/grpo_events.sh:67`](grpo_events.sh:67) +
+[`rl/video_event_plugin.py`](video_event_plugin.py)
+
+**问题**：`--vllm_server_pass_dataset true` 时，GRPO client 把 dataset 推到
+vLLM server，但 `events` / `source_video` 等非标准字段是怎么从样本透传到
+`InferRequest` 的（属性？data_dict？dict-like？）—— ms-swift 黑盒；不同
+版本可能行为不同；失败时 _get_source_video 走 videos[0] fallback 会静默
+误用。
+
+**修复**：双管齐下
+1. **运行时字段命中追踪**：`_get_events()` / `_get_source_video()` 每种来源
+   首次命中时 `logger.info`，输出形如
+   `[ms-swift field probe] source_video 字段命中来源 = attr (首次记录...)`
+   让运维启动 GRPO 后 5 秒内就能确认字段透传走的哪条路径
+2. **启动 sanity check**：`rl/grpo_events.sh` 对 D/J 自动跑
+   `verify_fields.py --check_files 5`，缺失 `source_video`/`events` 直接 exit 1
+
+### ⚪ 经核实是子代理误判（无需修复）
+
+#### 问题 1：rollout `infer_request.videos` 累加与消息对齐的隐患（误报）
+**核实结论**：[`video_event_plugin.py:298-307`](video_event_plugin.py:298-307)
+当前两个 if 条件实际一致：
+- L298 写 `<video>×len(processed_paths)` 仅在 `not errors and processed_paths`
+- L306 `extend(processed_paths)` 仅在 `not errors`（且 `processed_paths`
+  在 errors=空 时自然非空，否则不会有这一支）
+
+errors 非空时既不会写 `<video>` 也不会 extend，对齐保持一致。
+
+#### 问题 8：J 第一轮 `loss_scale=last_two_rounds` 失监督（误报）
+**核实结论**：J 数据多轮结构为
+```
+[system, user(N images + question), assistant(think+tool_call), user(N clips + success), assistant(answer)]
+```
+仅有 **2 个 assistant turn**，`last_two_rounds` 全部覆盖。第一轮 think+tool_call
+有监督，本问题不存在。
+（如果未来扩展到 ≥3 个 assistant turn，再考虑 `last_three_rounds`。）
+
+### 🟠 中危（已记录，待用户决定）
+
+| ID | 标题 | 位置 | 状态 |
+|----|------|------|------|
+| 5 | `OVERLAP_EPS=0.01s` 在短事件上易让邻近 sentence 污染 caption | [`scripts/convert_annotations.py:34`](../scripts/convert_annotations.py:34) | **观察项**：实际数据短事件比例需统计后决定是否改进 |
+| 6 | `max_turns=3` 截断行为不明确（第 4 轮怎么处理） | [`rl/rollout_events.sh:62`](rollout_events.sh:62) | **观察项**：日志中统计 `</answer>` 缺失率 |
+| 7 | `IMAGE_LIMIT=32`（J）/ `64`（D）未基于 scene_metadata N 分布验证 | [`rl/rollout_events.sh:27`](rollout_events.sh:27) | **观察项**：跑 `jq '.events|length' scene_metadata.json` 统计 |
+
+### 🟡 低危（观察项）
+
+- **问题 9**：[`scripts/convert_annotations_b/c/e.py`](../scripts/) 没有 D/J 的
+  `images/source_video` 字段断言。低概率风险（混用错脚本时静默生成不一致样本）。
+- **问题 10**：[`scripts/preprocess_scenes.py:391-408,460-469`](../scripts/preprocess_scenes.py:391-408)
+  边界事件（帧数<3 / 检测为空）处理缺日志。
+
+### 字段命中追踪日志怎么看
+
+启动 GRPO 后头几条 trajectory 应该看到（典型 J 样本）：
+```
+[ms-swift field probe] events 字段命中来源 = attr （首次记录；后续命中相同来源不再打印）
+[ms-swift field probe] source_video 字段命中来源 = attr （首次记录；后续命中相同来源不再打印）
+```
+若出现 `system_text_fallback` 或 `videos[0]_fallback`，说明 D/J 字段透传**失败**，
+模型实际跑的是 baseline 流程。立刻停训排查。
+
+若出现 `data_dict` 或 `dict_like`，说明 ms-swift 走的是另一种挂载方式，
+功能仍正常但需要关注 ms-swift 版本兼容性。

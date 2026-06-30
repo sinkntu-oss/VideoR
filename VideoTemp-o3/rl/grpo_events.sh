@@ -40,6 +40,32 @@ echo "  输出目录: $OUTPUT_DIR"
 echo "  (如需指定具体 checkpoint，请用 MODEL=sft/ckpt/test_events_${PROMPT_STYLE}/checkpoint-xxx bash rl/grpo_events.sh)"
 echo "============================================"
 
+# [问题 4] RL 数据集 sanity check：
+#   - 文件存在 + 非空
+#   - D/J 必需的顶层字段 (source_video/events) 抽样校验
+DATASET_FILES=("$DATA_DIR/qa.jsonl" "$DATA_DIR/grounding.jsonl")
+MISSING=()
+for f in "${DATASET_FILES[@]}"; do
+    if [ ! -s "$f" ]; then MISSING+=("$f"); fi
+done
+if [ ${#MISSING[@]} -gt 0 ]; then
+    echo "[ERROR] 以下 RL 数据文件缺失或为空：" >&2
+    for f in "${MISSING[@]}"; do echo "  - $f" >&2; done
+    echo "[ERROR] 请先运行: PROMPT_STYLE=$PROMPT_STYLE bash scripts/prepare_event_data.sh" >&2
+    exit 1
+fi
+if [[ "$PROMPT_STYLE" == "d" || "$PROMPT_STYLE" == "j" ]]; then
+    if [ -f "scripts/plan_j/verify_fields.py" ]; then
+        echo "[问题 4] 运行字段抽样校验 (--check_files 5)..."
+        python scripts/plan_j/verify_fields.py "$DATA_DIR" --check_files 5 || {
+            echo "[ERROR] 字段校验失败：D/J 必需的 source_video/events 字段缺失或格式异常" >&2
+            echo "[ERROR] 可能的修复方式：重新跑 scripts/plan_j/convert_annotations_j.py" >&2
+            exit 1
+        }
+    fi
+fi
+echo "[OK] RL 数据集 sanity check 通过"
+
 # Image 像素参数（方案 D / J 必需；其他方案无 <image> 输入时无影响）
 MAX_PIXELS="${MAX_PIXELS:-501760}"
 MIN_PIXELS="${MIN_PIXELS:-50176}"
