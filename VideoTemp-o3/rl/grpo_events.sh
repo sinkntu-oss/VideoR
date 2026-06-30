@@ -2,9 +2,47 @@
 # ============================================================
 # 事件定位版 GRPO 训练启动脚本
 # 使用 video_event_plugin.py 和 event_reward 替代原有版本
+#
+# 支持 5 套 prompt 风格（通过 PROMPT_STYLE 环境变量选择）：
+#   baseline (默认) - 数据集: rl/data_events/
+#   b               - 数据集: rl/data_events_b/
+#   c               - 数据集: rl/data_events_c/
+#   d               - 数据集: rl/data_events_d/   (关键帧版)
+#   e               - 数据集: rl/data_events_e/
+#
+# 使用:
+#   bash rl/grpo_events.sh                  # baseline
+#   PROMPT_STYLE=d bash rl/grpo_events.sh   # 方案 D
 # ============================================================
+
+PROMPT_STYLE="${PROMPT_STYLE:-baseline}"
+
+case "$PROMPT_STYLE" in
+    baseline) DATA_DIR="rl/data_events"   ;;
+    b)        DATA_DIR="rl/data_events_b" ;;
+    c)        DATA_DIR="rl/data_events_c" ;;
+    d)        DATA_DIR="rl/data_events_d" ;;
+    e)        DATA_DIR="rl/data_events_e" ;;
+    *) echo "[ERROR] Unknown PROMPT_STYLE: $PROMPT_STYLE (expected: baseline|b|c|d|e)" >&2; exit 1 ;;
+esac
+
+OUTPUT_DIR="${OUTPUT_DIR:-rl/ckpt/test_events_${PROMPT_STYLE}}"
+MODEL="${MODEL:-sft/ckpt/test}"
+
+echo "============================================"
+echo "  GRPO 训练  PROMPT_STYLE=$PROMPT_STYLE"
+echo "  起点模型: $MODEL"
+echo "  数据目录: $DATA_DIR"
+echo "  输出目录: $OUTPUT_DIR"
+echo "============================================"
+
+# Image 像素参数（方案 D 必需；其他方案无 <image> 输入时无影响）
+MAX_PIXELS="${MAX_PIXELS:-501760}"
+MIN_PIXELS="${MIN_PIXELS:-50176}"
+
 PYTORCH_CUDA_ALLOC_CONF='expandable_segments:True' \
-MAX_PIXELS=501760 \
+MAX_PIXELS=$MAX_PIXELS \
+MIN_PIXELS=$MIN_PIXELS \
 DECORD_EOF_RETRY_MAX=20480 \
 VIDEO_MIN_PIXELS=50176 \
 VIDEO_MAX_PIXELS=50176 \
@@ -13,7 +51,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 \
 NPROC_PER_NODE=6 \
 swift rlhf \
     --rlhf_type grpo \
-    --model sft/ckpt/test \
+    --model $MODEL \
     --train_type full \
     --external_plugins rl/video_event_plugin.py \
     --reward_funcs acc_reward event_reward tool_penalty format_reward \
@@ -27,7 +65,7 @@ swift rlhf \
     --freeze_vit true \
     --freeze_aligner false \
     --freeze_llm false \
-    --dataset rl/data_events/qa.jsonl rl/data_events/grounding.jsonl \
+    --dataset $DATA_DIR/qa.jsonl $DATA_DIR/grounding.jsonl \
     --split_dataset_ratio 0 \
     --max_completion_length 4096 \
     --num_train_epochs 1 \
@@ -51,4 +89,4 @@ swift rlhf \
     --attn_impl flash_attn \
     --deepspeed zero2 \
     --report_to tensorboard \
-    --output_dir rl/ckpt/test_events
+    --output_dir $OUTPUT_DIR

@@ -170,6 +170,36 @@ class EventLocatingScheduler(MultiTurnScheduler):
             return self._parse_events_from_system_text(getattr(infer_request, 'messages', None))
         return events or None
 
+    def _get_source_video(self, infer_request) -> Optional[str]:
+        """获取主视频路径：优先样本元数据 source_video → 兜底 videos[0]。
+
+        方案 D 取消了主视频（videos 字段仅留 tool 调用产物甚至为空），故需要从样本
+        元数据 `source_video` 字段拿到原视频路径来做 tool 调用裁剪。其他方案下
+        videos[0] 即主视频，自动走兜底分支，行为不变。
+
+        访问优先级（与 _get_events 对齐）：
+          1. infer_request.source_video    （属性）
+          2. infer_request.data_dict       （dict 字段）
+          3. infer_request[...]            （dict-like）
+          4. infer_request.videos[0]       （baseline 兜底）
+
+        相对路径会基于 cwd 拼成绝对路径（与 ms-swift 加载 videos 字段的行为一致）。
+        """
+        src = getattr(infer_request, 'source_video', None)
+        if not src:
+            dd = getattr(infer_request, 'data_dict', None)
+            if isinstance(dd, dict):
+                src = dd.get('source_video')
+        if not src:
+            try:
+                src = infer_request['source_video']  # type: ignore[index]
+            except (TypeError, KeyError, AttributeError):
+                pass
+        if not src:
+            vids = getattr(infer_request, 'videos', None) or []
+            return vids[0] if vids else None
+        return src if os.path.isabs(src) else os.path.abspath(src)
+
     def check_finished(self, infer_request, response_choice, current_turn) -> bool:
         if ANSWER_PAT.search(response_choice.message.content):
             return True
@@ -178,8 +208,9 @@ class EventLocatingScheduler(MultiTurnScheduler):
     def step(self, infer_request, response_choice, current_turn) -> Dict:
         try:
             completion = response_choice.message.content
-            if infer_request.videos:
-                self.current_video_path = infer_request.videos[0]
+            src_video = self._get_source_video(infer_request)
+            if src_video:
+                self.current_video_path = src_video
 
             events = self._get_events(infer_request)
             selected_ids = parse_event_ids(completion)  # 取首个 tool_call

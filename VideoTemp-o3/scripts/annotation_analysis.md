@@ -386,78 +386,76 @@ assert tag_count == len(s["videos"])
 
 > 把 4 套数据扔进现有训练流程（[`sft/sft_events.sh`](../sft/sft_events.sh) / [`rl/grpo_events.sh`](../rl/grpo_events.sh) / [`rl/video_event_plugin.py`](../rl/video_event_plugin.py)）会发生什么？以下按"环节 × 方案"逐项核对。
 
-### 7.1 总览矩阵
+### 7.1 总览矩阵（已含修复进度）
 
 | 环节 | 涉及文件 | B | C | D | E |
 |------|---------|---|---|---|---|
 | SFT swift 训练 | [`sft_events.sh`](../sft/sft_events.sh) | ✅ | ✅ | ⚠️ 需加 image 像素参数 | ⚠️ 需验证 `tools` 字段渲染 |
 | Loss scale 插件 | [`loss_scale_plugin.py`](../sft/loss_scale_plugin.py) | ✅ | ✅ | ✅ | ✅ |
-| **RL rollout 事件解析** | [`video_event_plugin.py:129-137`](../rl/video_event_plugin.py:129-137) | ❌ | ❌ | ❌ | ✅ |
-| **RL rollout 主视频路径** | [`video_event_plugin.py:147-148`](../rl/video_event_plugin.py:147-148) | ✅ | ✅ | ❌ | ✅ |
-| **RL 数据转换** | `convert_rl_sample` | ✅ | ✅ | ❌（未 patch） | ✅ |
-| RL 奖励计算 | [`video_event_plugin.py:243-261`](../rl/video_event_plugin.py:243-261) | ✅ | ✅ | ✅ | ✅ |
+| **RL rollout 事件解析** | [`video_event_plugin.py`](../rl/video_event_plugin.py:139-171) | ✅ 已修复 | ✅ 已修复 | ✅ 已修复 | ✅ |
+| **RL rollout 主视频路径** | [`video_event_plugin.py`](../rl/video_event_plugin.py:173-201) | ✅ | ✅ | ✅ 已修复 | ✅ |
+| **RL 数据转换** | `convert_rl_sample` | ✅ | ✅ | ✅ 已修复 | ✅ |
+| RL 奖励计算 | [`video_event_plugin.py`](../rl/video_event_plugin.py) | ✅ | ✅ | ✅ | ✅ |
 | 数据准备脚本协调 | [`prepare_event_data.sh`](prepare_event_data.sh) | ⚠️ 需手动跑 | ⚠️ | ⚠️ | ⚠️ |
 
 ---
 
-### 7.2 最严重的阻断点：RL rollout 的 system 解析（B/C/D 全部踩坑）
+### 7.2 RL rollout 的 system 解析（B/C/D 阻断点 → ✅ 已修复）
 
-[`EventLocatingScheduler._parse_events_from_system()`](../rl/video_event_plugin.py:129-137) 在 rollout 时**用 regex 从 system prompt 文本里抠事件列表**：
+**原问题**：[`EventLocatingScheduler._parse_events_from_system()`](../rl/video_event_plugin.py:129-137) 在 rollout 时**用 regex 从 system prompt 文本里抠事件列表**，强依赖 baseline 的 `Event N: a.bs - b.cs` 字面格式。B 移到了 user / C 抹掉时间戳 / D 完全没有此格式 → 返回 `None` → scheduler 收到 `"[Error] No valid event selection."` → tool 调用全部失败。
 
-```python
-EVENT_LINE_PAT = re.compile(r'Event\s+(\d+):\s+([\d.]+)s\s*-\s*([\d.]+)s')
+**修复**：在 [`rl/video_event_plugin.py`](../rl/video_event_plugin.py:139-171) 中：
 
-def _parse_events_from_system(self, messages):
-    if not messages or messages[0].get("role") != "system":
-        return None
-    events = [{"event_id": ..., "start_time": ..., "end_time": ...}
-              for m in EVENT_LINE_PAT.finditer(messages[0].get("content", ""))]
-    return events or None
-```
+- 原 `_parse_events_from_system` 改名 `_parse_events_from_system_text`，**仅作兜底**（baseline 数据行为 100% 不变）。
+- 新增 `_get_events(infer_request)` 作主入口，4 级 fallback：
 
-| 方案 | 触发结果 |
-|------|---------|
-| **B** | system 改为通用模板，**完全不含** `Event N: a.bs - b.cs` 行 → 返回 `None` → scheduler 收到 `"[Error] No valid event selection."` → tool 调用全部失败 ❌ |
-| **C** | system 只说 "4 events indexed 0..3"，**没有具体时间戳** → 同样返回 `None` ❌ |
-| **D** | system 说 "8 keyframes..."，**没有任何 Event 行** → 同样返回 `None` ❌ |
-| **E** | system 完整保留事件列表 → ✅ 兼容 |
+  ```
+  1. infer_request.events            （属性）
+  2. infer_request.data_dict['events']
+  3. infer_request['events']         （dict-like）
+  4. system 文本 regex 兜底（baseline 行为）
+  ```
 
-**修复方案**（强烈推荐，对 4 方案通用）：把 `_parse_events_from_system` 改为优先从样本元数据读取。事实上奖励侧 [`video_event_plugin.py:250-251`](../rl/video_event_plugin.py:250-251) 已经这么做了：
+- 数据格式异常时降级到兜底 + warning，不会让 rollout 崩。
+- 调用点 [`step()`](../rl/video_event_plugin.py:178-212) 同步替换。
 
-```python
-events_list.append(traj.get('events', []))
-covering_list.append(traj.get('gt_covering_event_ids', traj.get('covering_event_ids', [])))
-```
-
-scheduler 也应当从 `infer_request` 的元数据通道拿 `events`，让事件信息与 prompt 形态彻底解耦。
+**效果**：B/C/D 的样本只要顶层保留 `events` 字段，rollout 就能拿到结构化事件列表，prompt 形态完全解耦。
 
 ---
 
-### 7.3 方案 D 独有的两个缺口
+### 7.3 方案 D 独有的两个缺口（→ ✅ 已修复）
 
-#### 缺口 1：RL 数据转换函数未 patch
+#### 缺口 1：RL 数据转换函数未 patch（→ ✅ 已修复）
 
-[`convert_annotations_d.py`](convert_annotations_d.py) **只 patch 了 `convert_sft_sample`，没 patch `convert_rl_sample`**。
+**原问题**：[`convert_annotations_d.py`](convert_annotations_d.py) 旧版**只 patch 了 `convert_sft_sample`，没 patch `convert_rl_sample`**。用方案 D 处理 RL 数据时，`build_system_prompt` 已被换成「2N keyframes...」版本，但 messages 和 videos 完全不变（仍是 `<video>` + 主视频）→ system 描述与实际输入严重错位。
 
-结果：用方案 D 处理 RL 数据时，`build_system_prompt` 已经被换成「2N keyframes...」版本，但 messages 和 videos **完全不变**（仍是 `<video>` + 主视频）。
-→ **system 描述与实际输入严重错位**：模型被告知"你会看到 2N 张关键帧"，但 user 里只塞了一个 `<video>` 主视频。
+**修复**：
 
-#### 缺口 2：rollout 时拿不到主视频路径
+- 把原 SFT 改造逻辑抽成共享函数 [`_apply_keyframe_rewrite()`](convert_annotations_d.py)，返回三态 `"ok" | "skip" | "drop"`。
+- 新增 `convert_rl_sample` patch，调用同一函数，RL 强制 `do_extract=True`（关键帧是 D 的硬输入，与 `do_crop` 解耦；已存在的帧文件自动跳过）。
+- SFT / RL 两条路径产出的样本结构完全对齐：相同的 system / `<image>` 占位 / `images` / `source_video` 字段。
 
-[`video_event_plugin.py:147-148`](../rl/video_event_plugin.py:147-148)：
+#### 缺口 2：rollout 时拿不到主视频路径（→ ✅ 已修复）
 
-```python
-if infer_request.videos:
-    self.current_video_path = infer_request.videos[0]
-```
+**原问题**：旧版 [`step():147-148`](../rl/video_event_plugin.py) 用 `current_video_path = infer_request.videos[0]`，方案 D 的 `videos` 为空 → 任何 tool 调用都拿不到原视频路径。
 
-方案 D 的 SFT 数据中 `videos = tool_clips`，第一轮启动时 `tool_clips` 为空 → `infer_request.videos = []` → `current_video_path` 不会被赋值，`hasattr` 检查失败 → 任何 tool 调用都拿不到原视频路径裁剪 clip ❌
+**修复**：
 
-**两个缺口的修复方向**：
+- 转换侧：[`_apply_keyframe_rewrite()`](convert_annotations_d.py) 给样本顶层注入 `source_video`（主视频相对路径）。
+- rollout 侧：新增 [`_get_source_video(infer_request)`](../rl/video_event_plugin.py:173-201)，4 级 fallback：
 
-- D 的样本元数据中显式保留 `source_video` 字段（顶层 `"source_video": "ActivityNet/videos/v_xxx.mp4"`）
-- `EventLocatingScheduler` 改为从这个字段读取，不再依赖 `infer_request.videos[0]`
-- 训练-推理一致性原则要求：SFT 用 keyframe 训练，RL 推理也必须从 keyframe 起步 → 需要 patch `convert_rl_sample` 做同样的关键帧抽取
+  ```
+  1. infer_request.source_video        （属性）
+  2. infer_request.data_dict['source_video']
+  3. infer_request['source_video']     （dict-like）
+  4. infer_request.videos[0]           （baseline 兜底）
+  ```
+
+  相对路径自动 `os.path.abspath(...)` 拼成绝对路径。其他方案保持 `videos[0]` 兜底，行为不变。
+
+#### 缺口 3：SFT 训练脚本缺 image 像素参数（⚠️ 待办）
+
+[`sft_events.sh:9-12`](../sft/sft_events.sh:9-12) 只设置了 video 相关像素参数。方案 D 引入大量 `<image>` 输入，需要补充 `MAX_PIXELS` / `MIN_PIXELS`（Qwen2.5-VL 单张图像素上下限），否则用默认值可能与训练目标不一致。**改训练脚本时一并加上即可**。
 
 ---
 
@@ -492,49 +490,53 @@ For each function call, return a json object within <tool_call></tool_call>...
 
 ---
 
-### 7.5 SFT 训练脚本的环境变量缺漏（方案 D）
+### 7.5 训练脚本统一参数化（→ ✅ 已完成）
 
-[`sft_events.sh:9-12`](../sft/sft_events.sh:9-12) 只设置了 video 相关像素参数：
+所有训练侧脚本现已支持通过 `PROMPT_STYLE` 环境变量切换 5 套数据，所有方案共用同一份脚本。
+
+| 脚本 | 支持的 PROMPT_STYLE | 关键变更 |
+|------|---------------------|---------|
+| [`prepare_event_data.sh`](prepare_event_data.sh) | `baseline\|b\|c\|d\|e` | case 分发到 5 个 `convert_annotations*.py`；输出 `{sft,rl}/data_events{_suffix}` |
+| [`sft/sft_events.sh`](../sft/sft_events.sh) | 同上 | 数据集路径用 `$DATA_DIR` 拼接；新增 `MAX_PIXELS` / `MIN_PIXELS`（方案 D 必需）；`OUTPUT_DIR` 默认含 PROMPT_STYLE |
+| [`rl/grpo_events.sh`](../rl/grpo_events.sh) | 同上 | 同上；新增 `MODEL` 环境变量 |
+| [`rl/rollout_events.sh`](../rl/rollout_events.sh) | 同上 | **方案 D 自动放宽** `--vllm_limit_mm_per_prompt` 的 `image` 数（baseline/b/c/e 保持 1，d 调到 64）；其他方案像素参数无影响 |
+
+**使用示例**：
 
 ```bash
-VIDEO_MIN_PIXELS=50176
-VIDEO_MAX_PIXELS=50176
-FPS_MAX_FRAMES=512
+# 方案 D 的端到端流程
+PROMPT_STYLE=d bash scripts/prepare_event_data.sh
+PROMPT_STYLE=d bash sft/sft_events.sh
+# RL（两个终端）
+PROMPT_STYLE=d MODEL=sft/ckpt/test_events_d/checkpoint-xxx bash rl/rollout_events.sh
+PROMPT_STYLE=d MODEL=sft/ckpt/test_events_d/checkpoint-xxx bash rl/grpo_events.sh
 ```
 
-方案 D 引入了大量 `<image>` 输入，需要补充：
-
-```bash
-MAX_PIXELS=...           # 单张图最大像素（Qwen2.5-VL）
-MIN_PIXELS=...           # 单张图最小像素
-```
-
-否则会用 ms-swift 默认值，可能与训练目标不一致。
+**[`rollout_events.sh`](../rl/rollout_events.sh) 中的隐藏陷阱**：原 `--vllm_limit_mm_per_prompt '{"image": 1, "video": 10}'` 硬限制 1 张 image，方案 D 一条样本最多 2×N≈30+ 张关键帧，超限会被 vllm 拒绝。**改造后按 PROMPT_STYLE 自动调整**，避免踩坑。
 
 ---
 
-### 7.6 `prepare_event_data.sh` 协调问题
+### 7.6 修复进度
 
-[`prepare_event_data.sh`](prepare_event_data.sh) 当前**写死只调 baseline `convert_annotations.py`**，4 个方案都需要绕过它手动跑。
+| 方案 | 状态 |
+|------|------|
+| **B** | ✅ 已通过 `_get_events()` 元数据读取修复 |
+| **C** | ✅ 同上 |
+| **D** | ✅ events 读取 / `source_video` 注入 / scheduler 读字段 / RL 数据转换 patch / 训练脚本 image 像素参数 全部完成 |
+| **E** | ⚠️ 待运行环境验证 `tools` 字段的 swift template 渲染行为 |
 
-如果要做体系化 A/B 实验，建议把它改成接受 `--prompt_style {baseline,b,c,d,e}` 参数 dispatch 到对应版本，并产出 `sft/data_events_{baseline,b,c,d,e}/` 5 份并列数据。
+**本次涉及的修改文件**：
 
----
+- [`rl/video_event_plugin.py`](../rl/video_event_plugin.py) — 新增 `_get_events()` + `_get_source_video()`；`step()` 调用点同步替换
+- [`scripts/convert_annotations_d.py`](convert_annotations_d.py) — 抽出共享改造函数 `_apply_keyframe_rewrite()`；新增 `convert_rl_sample` patch；样本注入 `source_video` 字段
+- [`scripts/prepare_event_data.sh`](prepare_event_data.sh) — 加 `PROMPT_STYLE` 分发
+- [`sft/sft_events.sh`](../sft/sft_events.sh) — 加 `PROMPT_STYLE` / `MAX_PIXELS` / `MIN_PIXELS`
+- [`rl/grpo_events.sh`](../rl/grpo_events.sh) — 加 `PROMPT_STYLE` / `MAX_PIXELS` / `MIN_PIXELS` / `MODEL`
+- [`rl/rollout_events.sh`](../rl/rollout_events.sh) — 加 `PROMPT_STYLE` / 按方案调整 `vllm_limit_mm_per_prompt`
 
-### 7.7 修复成本与推荐顺序
+**剩余待办**：
 
-| 方案 | 必改文件 | 修复成本 | 推荐优先级 |
-|------|---------|---------|------|
-| **B** | [`video_event_plugin.py`](../rl/video_event_plugin.py) 的 `_parse_events_from_system` 改为读元数据 | 低（5-10 行） | ⭐⭐⭐ |
-| **C** | 同 B + 同样改 `_parse_events_from_system` | 低（同上） | ⭐⭐ |
-| **D** | 同 B + patch `convert_rl_sample` 做关键帧抽取 + 样本加 `source_video` 字段 + scheduler 改用此字段 + `sft_events.sh` 加 image 像素参数 | **高** | ⭐ |
-| **E** | 验证 swift 渲染行为；若 `tools` 自动注入则手写 system 同步精简 | 中 | ⭐⭐⭐ |
-
-**推荐落地顺序**：
-
-1. **先改 [`_parse_events_from_system`](../rl/video_event_plugin.py:129-137)**，让它优先从 `infer_request` 元数据读 events，作为对 B/C/D/E 通用的 RL rollout 基础设施改造（一次改造，4 方案受益）
-2. 选择目标方案做 A/B：推荐先跑 **B** 或 **E**，修复成本最低
-3. 若选 D：需先补完 4 项（RL 数据转换 / 主视频字段 / scheduler 适配 / image 像素参数）才能跑 RL；只跑 SFT 的话只补 patch RL 数据转换函数即可
+1. 方案 E：跑一条样本打印渲染后的 system，确认 `tools` 字段被 Qwen2.5-VL chat template 正确注入；若 swift 会自动追加 tools 描述，可考虑精简 [`convert_annotations_e.py`](convert_annotations_e.py) 手写 system 中的部分内容避免重复。
 
 ---
 
