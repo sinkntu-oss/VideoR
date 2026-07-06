@@ -131,6 +131,7 @@ class EventLocatingScheduler(MultiTurnScheduler):
 
     def _crop_event(self, input_path: str, start_time: float, end_time: float) -> str:
         """裁剪一个事件片段，返回片段路径或 [Error] 字符串。"""
+        out_path = None
         try:
             if start_time < 0 or end_time <= start_time:
                 raise ValueError(f"Invalid: start={start_time}, end={end_time}")
@@ -151,21 +152,31 @@ class EventLocatingScheduler(MultiTurnScheduler):
             nframes = self.smart_nframes(max_fr, fps)
             interval = max(1, max_fr // nframes)
 
+            # [R1] try/finally 确保 cap/out 句柄释放；异常时下方 except 删除孤儿 mp4，
+            #      防止长跑 GRPO 泄漏 fd + 累积孤儿片段撑爆磁盘。
             out = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"mp4v"), nframes / clip_dur, (w, h))
             cap = cv2.VideoCapture(input_path)
-            cap.set(cv2.CAP_PROP_POS_FRAMES, int(start_time * fps))
-            for idx in range(max_fr):
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                if idx % interval == 0:
-                    out.write(frame)
-            cap.release()
-            out.release()
+            try:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, int(start_time * fps))
+                for idx in range(max_fr):
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    if idx % interval == 0:
+                        out.write(frame)
+            finally:
+                cap.release()
+                out.release()
             if not os.path.exists(out_path) or os.path.getsize(out_path) < 1024:
                 raise RuntimeError(f"Output invalid: {out_path}")
             return out_path
         except Exception as e:
+            # [R1] 清理可能已创建的孤儿输出文件
+            if out_path and os.path.exists(out_path):
+                try:
+                    os.remove(out_path)
+                except OSError:
+                    pass
             return f"[Error] {e}"
 
     def _parse_events_from_system_text(self, messages: List[Dict]) -> Optional[List[Dict]]:

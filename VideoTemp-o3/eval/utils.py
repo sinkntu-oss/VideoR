@@ -199,6 +199,7 @@ def smart_nframes(total_frames: int, video_fps: int | float) -> int:
 
 def _crop_video(input_path: str, output_dir: str, start_time: float, end_time: float) -> str:
     """Crop a video segment with strict FPS consistency checks."""
+    output_path = None
     try:
         if start_time < 0 or end_time <= start_time:
             raise ValueError(f"Invalid timestamp: start={start_time}, end={end_time}")
@@ -221,34 +222,35 @@ def _crop_video(input_path: str, output_dir: str, start_time: float, end_time: f
         frame_interval = max_frames // nframes
 
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        # [R1] try/finally 确保 cap/out 句柄释放；异常时下方 except 删除孤儿 mp4。
         out = cv2.VideoWriter(output_path, fourcc, crop_video_fps, (orig_width, orig_height))
-
         cap = cv2.VideoCapture(input_path)
-        pos_set_success = cap.set(cv2.CAP_PROP_POS_FRAMES, int(start_time * orig_fps))
+        try:
+            pos_set_success = cap.set(cv2.CAP_PROP_POS_FRAMES, int(start_time * orig_fps))
 
-        if not pos_set_success:
-            print("Warning: Seeking to start frame failed, reading frame-by-frame...")
-            current_pos = 0
-            target_pos = int(start_time * orig_fps)
-            while current_pos < target_pos and cap.isOpened():
-                ret, _ = cap.read()
+            if not pos_set_success:
+                print("Warning: Seeking to start frame failed, reading frame-by-frame...")
+                current_pos = 0
+                target_pos = int(start_time * orig_fps)
+                while current_pos < target_pos and cap.isOpened():
+                    ret, _ = cap.read()
+                    if not ret:
+                        raise RuntimeError("Unable to reach the starting frame (original video too short).")
+                    current_pos += 1
+
+            current_frame_in_clip = 0
+            while current_frame_in_clip < max_frames:
+                ret, frame = cap.read()
                 if not ret:
-                    raise RuntimeError("Unable to reach the starting frame (original video too short).")
-                current_pos += 1
-
-        current_frame_in_clip = 0
-        while current_frame_in_clip < max_frames:
-            ret, frame = cap.read()
-            if not ret:
-                print(f"Warning: Reached end of video early. Expected {max_frames} frames, got {current_frame_in_clip}")
-                break
-            if current_frame_in_clip % frame_interval == 0:
-                out.write(frame)
-            current_frame_in_clip += 1
-
-        cap.release()
-        out.release()
-        cv2.destroyAllWindows()
+                    print(f"Warning: Reached end of video early. Expected {max_frames} frames, got {current_frame_in_clip}")
+                    break
+                if current_frame_in_clip % frame_interval == 0:
+                    out.write(frame)
+                current_frame_in_clip += 1
+        finally:
+            cap.release()
+            out.release()
+            cv2.destroyAllWindows()
 
         print(f"Video processing completed. Output: {output_path}")
         if not os.path.exists(output_path):
@@ -261,6 +263,12 @@ def _crop_video(input_path: str, output_dir: str, start_time: float, end_time: f
         return output_path
 
     except Exception as e:
+        # [R1] 清理可能已创建的孤儿输出文件
+        if output_path and os.path.exists(output_path):
+            try:
+                os.remove(output_path)
+            except OSError:
+                pass
         return f"Video processing error: {str(e)}"
 
 
@@ -377,12 +385,24 @@ def _build_event_system_prompt(events: List[Dict], style: str, video_key: str) -
     raise ValueError(f"Unsupported event-style: {style}")
 
 
+def _events_fingerprint(events: List[Dict]) -> str:
+    """[R2] events 内容指纹（event_id + 起止时间）。嵌入关键帧缓存路径，
+    scene_metadata 重新分割事件后指纹变化 → 不再静默复用错位的旧帧。
+    与 scripts/convert_annotations_d.py 的同名函数保持一致算法。"""
+    key = ";".join(
+        f"{e['event_id']}:{round(float(e['start_time']), 3)}:{round(float(e['end_time']), 3)}"
+        for e in events
+    )
+    return hashlib.sha1(key.encode()).hexdigest()[:12]
+
+
 def _extract_event_keyframes(
     video_abs: str, events: List[Dict], n_kf: int, video_rel: str
 ) -> Optional[List[str]]:
     """按事件等距抽 n_kf 张关键帧，返回 N*n_kf 张绝对路径列表。已存在则跳过。"""
     safe = os.path.splitext(video_rel)[0].replace("/", "_").replace(os.sep, "_")
-    out_dir = os.path.join(EVAL_KEYFRAME_DIR, safe)
+    # [R2] 缓存目录嵌入 events 指纹，重分割后自动换新目录、不复用错位旧帧
+    out_dir = os.path.join(EVAL_KEYFRAME_DIR, safe, _events_fingerprint(events))
     os.makedirs(out_dir, exist_ok=True)
 
     paths: List[str] = []
@@ -424,6 +444,26 @@ def _extract_event_keyframes(
 # ==============================================================================
 # Agent Core
 # ==============================================================================
+def _extract_final_answer(text: str) -> str:
+    """[T1] 提取 <answer> 内容，容忍缺失的闭合 </answer>。
+
+    请求里 stop=["</answer>"]，若 vLLM 侧 include_stop_str_in_output=False（默认）
+    会把闭合标签剥掉，导致输出结尾是 `...<answer>C`（无 </answer>）。此时严格正则
+    `<answer>(.*?)</answer>` 匹配失败，final_answer 会退化成整段含 <think> 的文本，
+    下游 score.py 取 response[0]=='<' → 非法选项 → 强判 'A'，分数系统性失真。
+
+    这里做双保险的第二层：优先匹配闭合形式，其次匹配开标签到结尾，最后兜底原文。
+    （第一层是给 create() 传 extra_body={"include_stop_str_in_output": True}）
+    """
+    m = re.search(r"<answer>(.*?)</answer>", text, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    m = re.search(r"<answer>(.*)", text, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    return (text or "").strip()
+
+
 def _run_agent_baseline(
     client: openai.Client,
     model_name: str,
@@ -471,6 +511,7 @@ def _run_agent_baseline(
                 temperature=0.1,
                 max_tokens=4096,
                 stop=["</answer>", "<|im_end|>"],
+                extra_body={"include_stop_str_in_output": True},  # [T1] 保留 </answer>，否则闭合标签被剥离
             )
             generated_text = response.choices[0].message.content
             print(f"🤖 Model Response:\n{generated_text}")
@@ -483,7 +524,7 @@ def _run_agent_baseline(
             "content": [{"type": "text", "text": generated_text}],
         })
 
-        if "</answer>" in generated_text:
+        if "<answer>" in generated_text:  # [T1] 用开标签判完成：闭合 </answer> 可能被 stop 剥离
             print("\n✅ Found final answer, task completed.")
             break
 
@@ -532,8 +573,7 @@ def _run_agent_baseline(
 
     print("\n" + "=" * 20 + " Agent run ended " + "=" * 20)
     final_response_text = conversation_history[-1]["content"][0]["text"]
-    answer_match = re.search(r"<answer>(.*?)</answer>", final_response_text, re.DOTALL)
-    final_answer = answer_match.group(1).strip() if answer_match else final_response_text
+    final_answer = _extract_final_answer(final_response_text)  # [T1] 容忍缺失 </answer>
 
     conv_history = [
         msg["content"][0]["text"]
@@ -614,6 +654,7 @@ def _run_agent_event_style(
                 temperature=0.1,
                 max_tokens=4096,
                 stop=["</answer>", "<|im_end|>"],
+                extra_body={"include_stop_str_in_output": True},  # [T1] 保留 </answer>，否则闭合标签被剥离
             )
             generated_text = response.choices[0].message.content
             print(f"🤖 Model Response:\n{generated_text}")
@@ -626,7 +667,7 @@ def _run_agent_event_style(
             "content": [{"type": "text", "text": generated_text}],
         })
 
-        if "</answer>" in generated_text:
+        if "<answer>" in generated_text:  # [T1] 用开标签判完成：闭合 </answer> 可能被 stop 剥离
             print("\n✅ Found final answer, task completed.")
             break
 
@@ -673,8 +714,7 @@ def _run_agent_event_style(
 
     print("\n" + "=" * 20 + " Agent run ended " + "=" * 20)
     final_response_text = conversation_history[-1]["content"][0]["text"]
-    answer_match = re.search(r"<answer>(.*?)</answer>", final_response_text, re.DOTALL)
-    final_answer = answer_match.group(1).strip() if answer_match else final_response_text
+    final_answer = _extract_final_answer(final_response_text)  # [T1] 容忍缺失 </answer>
 
     conv_history = [
         msg["content"][0]["text"]

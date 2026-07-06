@@ -149,23 +149,37 @@ def crop_event_clip(video_abs: str, start: float, end: float, out_abs: str) -> b
         nframes = _smart_nframes(max_fr, fps)
         interval = max(1, max_fr // nframes)
 
+        # [R1] try/finally 确保 cap/out 句柄释放；失败时删除孤儿 mp4。
         out = cv2.VideoWriter(out_abs, cv2.VideoWriter_fourcc(*"mp4v"), nframes / clip_dur, (w, h))
         cap = cv2.VideoCapture(video_abs)
-        cap.set(cv2.CAP_PROP_POS_FRAMES, int(start * fps))
-        for idx in range(max_fr):
-            ret, frame = cap.read()
-            if not ret:
-                break
-            if idx % interval == 0:
-                out.write(frame)
-        cap.release()
-        out.release()
+        try:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(start * fps))
+            for idx in range(max_fr):
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                if idx % interval == 0:
+                    out.write(frame)
+        finally:
+            cap.release()
+            out.release()
         if not os.path.exists(out_abs) or os.path.getsize(out_abs) < 1024:
             logger.warning(f"裁剪产物无效: {out_abs}")
+            if os.path.exists(out_abs):
+                try:
+                    os.remove(out_abs)
+                except OSError:
+                    pass
             return False
         return True
     except Exception as e:
         logger.warning(f"裁剪失败 {video_abs} [{start},{end}]: {e}")
+        # [R1] 清理可能已创建的孤儿输出文件
+        if os.path.exists(out_abs):
+            try:
+                os.remove(out_abs)
+            except OSError:
+                pass
         return False
 
 
@@ -249,7 +263,14 @@ def convert_sft_sample(sample, index, project_root, clip_dir, do_crop, stats) ->
         timestamps = parse_clip_timestamps(msg.get("content", ""))
         if timestamps is None:
             continue
-        event_ids = find_covering_events_multi(events, timestamps) or [events[0]["event_id"]]
+        # [R4] tool_call 时间戳未覆盖任何事件 → 不再兜底伪造 "event 0"（那会注入错误监督：
+        #      错误的 locate_events 目标 + 无关的 <video> 片段）。事件连续铺满全片，
+        #      空覆盖=退化/越界时间戳，直接丢弃整条样本。
+        event_ids = find_covering_events_multi(events, timestamps)
+        if not event_ids:
+            stats["tool_empty_cover"] += 1
+            logger.warning(f"tool_call 时间戳未覆盖任何事件(已丢弃): {timestamps} video={main_video}")
+            return None
         msg["content"] = rewrite_think(replace_tool_call_with_events(msg["content"], event_ids), events)
 
         if i + 1 < len(messages) and messages[i + 1].get("role") == "user":
@@ -279,7 +300,13 @@ def convert_sft_sample(sample, index, project_root, clip_dir, do_crop, stats) ->
     if isinstance(s.get("timestamp"), list) and s["timestamp"]:
         s["covering_event_ids"] = find_covering_events_multi(events, s["timestamp"])
         if not s["covering_event_ids"]:
+            # [R4] 空覆盖集：grounding 样本(答案即定位) acc 与 event_reward 恒 0 → 纯噪声，丢弃；
+            #      qa 样本 acc 仍有效 → 保留但告警。事件连续铺满全片，空覆盖=退化时间戳标注。
             stats["empty_cover"] += 1
+            if s.get("data_type") == "grounding":
+                logger.warning(f"grounding 空覆盖集(已丢弃): timestamp={s['timestamp']} video={main_video}")
+                return None
+            logger.warning(f"空覆盖集(保留，event_reward 将为 0): timestamp={s['timestamp']} video={main_video}")
     s.pop("tool_params", None)  # 移除冗余字段 (问题 5)
     return s
 
@@ -303,9 +330,20 @@ def convert_rl_sample(sample, index, project_root, clip_dir, do_crop, stats) -> 
     if isinstance(s.get("timestamp"), list) and s["timestamp"]:
         s["covering_event_ids"] = find_covering_events_multi(events, s["timestamp"])
         if not s["covering_event_ids"]:
+            # [R4] 同 SFT：grounding 空覆盖=纯噪声丢弃；qa 保留(acc 有效)
             stats["empty_cover"] += 1
+            if s.get("data_type") == "grounding":
+                logger.warning(f"grounding 空覆盖集(已丢弃): timestamp={s['timestamp']} video={videos[0]}")
+                return None
     if isinstance(s.get("gt_time_stamp"), list) and s["gt_time_stamp"]:
-        s["gt_covering_event_ids"] = find_covering_events_multi(events, s["gt_time_stamp"])
+        gt_ids = find_covering_events_multi(events, s["gt_time_stamp"])
+        # [R4] 仅在非空时写 gt_covering_event_ids：否则空列表会因 reward 里
+        #      traj.get('gt_covering_event_ids', covering_event_ids) 的"按键存在取值"语义
+        #      SHADOW 掉有效的 covering_event_ids（见 rl/video_event_plugin.py:417）。
+        if gt_ids:
+            s["gt_covering_event_ids"] = gt_ids
+        else:
+            stats["empty_gt_cover"] += 1
     return s
 
 
@@ -376,7 +414,9 @@ def main():
     logger.info("=" * 60)
     logger.info(f"完成: 总 {total_all} / 成功 {success_all} / 失败 {failed_all} -> {args.output_dir}")
     logger.info(f"诊断: 元数据未命中={stats['meta_miss']} 对齐不一致={stats['align_mismatch']} "
-                f"空覆盖集={stats['empty_cover']} 裁剪失败={stats['crop_fail']}")
+                f"空覆盖集={stats['empty_cover']} 裁剪失败={stats['crop_fail']} "
+                f"关键帧抽取失败={stats['keyframe_fail']} 关键帧缺失丢弃={stats['keyframe_missing']} "
+                f"tool空覆盖丢弃={stats['tool_empty_cover']} gt空覆盖={stats['empty_gt_cover']}")
     logger.info("=" * 60)
 
 

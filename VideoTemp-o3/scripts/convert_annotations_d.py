@@ -84,9 +84,21 @@ def _split_videos(videos, clip_dir):
     return base_videos, tool_clips
 
 
-def _keyframe_rel_path(main_video_rel, event_id, kf_idx, kf_root):
+def _events_fingerprint(events) -> str:
+    """[R2] events 内容指纹（event_id + 起止时间）。嵌入关键帧缓存路径，
+    scene_metadata 重新分割事件后指纹变化 → 不再静默复用错位的旧帧。
+    按每视频粒度，改一个视频的分割只失效该视频的缓存。"""
+    import hashlib
+    key = ";".join(
+        f"{e['event_id']}:{round(float(e['start_time']), 3)}:{round(float(e['end_time']), 3)}"
+        for e in events
+    )
+    return hashlib.sha1(key.encode()).hexdigest()[:12]
+
+
+def _keyframe_rel_path(main_video_rel, event_id, kf_idx, kf_root, fp):
     safe = os.path.splitext(main_video_rel)[0].replace("/", "_").replace(os.sep, "_")
-    return os.path.join(kf_root, safe, f"event_{event_id}_kf_{kf_idx}.jpg")
+    return os.path.join(kf_root, safe, fp, f"event_{event_id}_kf_{kf_idx}.jpg")
 
 
 def extract_event_keyframes(video_abs, start, end, n_frames, out_paths_abs):
@@ -156,9 +168,10 @@ def _apply_keyframe_rewrite(out, project_root, clip_dir, do_extract, stats):
 
     # 抽 N×K 张关键帧
     images_rel = []
+    fp = _events_fingerprint(events)  # [R2] 版本指纹，随事件分割变化
     for ev in events:
         rels = [
-            _keyframe_rel_path(main_rel, ev["event_id"], i, kf_root)
+            _keyframe_rel_path(main_rel, ev["event_id"], i, kf_root, fp)
             for i in range(N_KEYFRAMES_PER_EVENT)
         ]
         abss = [r if os.path.isabs(r) else os.path.join(project_root, r) for r in rels]
@@ -167,6 +180,13 @@ def _apply_keyframe_rewrite(out, project_root, clip_dir, do_extract, stats):
                                          N_KEYFRAMES_PER_EVENT, abss)
             if not ok:
                 stats["keyframe_fail"] += 1
+                return "drop"
+        else:
+            # [T2] do_extract=False（如 SFT do_crop=False / --no_crop_clips）时不能盲目写 images：
+            #      关键帧是 D 的硬输入，必须真实存在。校验缓存，缺失则丢弃样本，
+            #      杜绝 images 指向不存在的 jpg（表面标签数对齐、加载/verify 时才暴露）。
+            if not all(os.path.exists(a) and os.path.getsize(a) > 0 for a in abss):
+                stats["keyframe_missing"] += 1
                 return "drop"
         images_rel.extend(rels)
 

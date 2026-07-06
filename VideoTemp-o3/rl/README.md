@@ -374,3 +374,142 @@ errors 非空时既不会写 `<video>` 也不会 extend，对齐保持一致。
 
 若出现 `data_dict` 或 `dict_like`，说明 ms-swift 走的是另一种挂载方式，
 功能仍正常但需要关注 ms-swift 版本兼容性。
+
+---
+
+## 全链路问题分析（2026-07-03 第三轮审计 · 待修复）
+
+> 第三轮逐文件复审覆盖了此前两轮未审的 **eval 链路、数据生成基座、训练脚本、数据插件**，
+> 识别出 **3 个高危单点** + **4 类跨文件系统性根因**（同一 bug 在多处重复）。
+> 本节仅**记录**，尚未修复；建议按下方优先级处理。
+
+### 🔴 高危单点
+
+#### T1 · eval `stop=["</answer>"]` 剥离闭合标签 → 评估分数系统性失真  ✅ 已修复（2026-07-03）
+
+**位置**：[`eval/utils.py:473,616`](../eval/utils.py) + [`eval/utils.py:535,676`](../eval/utils.py) + [`eval/score.py:52-54`](../eval/score.py)
+
+**问题**：请求带 `stop=["</answer>", "<|im_end|>"]`，vLLM 默认 `include_stop_str_in_output=False`
+会把 stop 串从输出剥掉 → `generated_text` 结尾是 `...<answer>C`（**无闭合 `</answer>`**）→
+`re.search(r"<answer>(.*?)</answer>")` 匹配失败 → `final_answer` 退化为整段含 `<think>` 的文本 →
+`score.py` 取 `response[0]` 得到 `"<"` → 不在 `{A..E}` → **强制判成 "A"**。
+后果：所有正确答案 ≠ A 的样本被系统性判错，**所有 benchmark 分数不可信，方案对比失效**。
+
+**修法（任一）**：① 请求加 `extra_body={"include_stop_str_in_output": True}`（推荐）；
+② 从 `stop` 去掉 `</answer>`；③ 命中 stop 时手动补回 `</answer>` 再正则。
+**动作前先用一条样本实测确认 vLLM 是否真剥离。**
+
+> **实际修法（双保险）**：① 两处 `create()` 加 `extra_body={"include_stop_str_in_output": True}`
+> 从源头保留 `</answer>`；② 新增 `_extract_final_answer()`，即使闭合标签被剥离也能提取
+> `<answer>` 内容（开标签兜底）；③ 完成检测由 `"</answer>" in` 改为 `"<answer>" in`。
+> 无论 server 是否遵守 extra_body 都正确。见 [`eval/utils.py:427`](../eval/utils.py:427)。
+
+#### T2 · D 方案 SFT `do_crop=False` 时 `images` 字段指向从未生成的 jpg  ✅ 已修复（2026-07-03）
+
+**位置**：[`scripts/convert_annotations_d.py:213-219`](../scripts/convert_annotations_d.py:213)
++ `_apply_keyframe_rewrite`（同文件 :159-171）
+
+**问题**：`convert_sft_sample` 传 `do_extract=do_crop`；`do_crop=False` 时 `if do_extract:`
+跳过真实抽帧，但 `images_rel.extend(rels)` **无条件执行** → 写出 `<image>` 标签 + `images` 字段 +
+`source_video`，但对应 jpg **全部不存在**。标签数对齐检查通过（数量对），要等 `verify_fields.py`
+抽样查文件或训练加载才暴露。
+
+**修法**：D 的 keyframe rewrite 应与抽帧绑定——`do_extract=False` 时 `return "skip"`（不改造）
+或直接报错，不要写入指向空文件的 `images`。
+
+> **实际修法**：`_apply_keyframe_rewrite` 在 `do_extract=False` 时改为**校验缓存帧真实存在**，
+> 缺失即 `return "drop"` + `stats["keyframe_missing"]`（保留 `--no_crop_clips` 复用已有帧的快路径，
+> 但绝不产出指向空文件的 `images`）；并把 `keyframe_fail/keyframe_missing` 加入
+> [`convert_annotations.py`](../scripts/convert_annotations.py) 汇总诊断行，避免静默丢样本。
+
+#### T3 · 工具"细看"返回的视频清晰度比初始关键帧低 10×
+
+**位置**：[`rl/grpo_events.sh:82-86`](grpo_events.sh:82) **且** [`rl/rollout_events.sh:48-51`](rollout_events.sh:48)
+（两条路径同款配置，训练与 RL 数据采集**均受影响**）
+
+**问题**：`MAX_PIXELS=501760`（关键帧 ≈708²）但 `VIDEO_MAX_PIXELS=VIDEO_MIN_PIXELS=50176`（视频每帧 ≈224²）。
+D/J 的核心逻辑是"低成本关键帧概览 → 需要看清时调 `locate_events` 换回完整视频细看"，
+但当前配置下 **tool 返回的视频比初始关键帧糊 10 倍**，从根本上瓦解工具调用收益
+（模型学到"调了也没用"，呼应 M10 的过度/不自信担忧）。
+修 T3 时**两个脚本要一起改**，否则 rollout 采集的数据与训练不一致。
+
+**修法**：让 `VIDEO_MAX_PIXELS` ≥ `MAX_PIXELS`，并放开 `VIDEO_MIN_PIXELS==VIDEO_MAX_PIXELS` 的锁死。
+**先确认是否为有意的 token 预算权衡。**
+
+### 🔴 跨文件系统性根因（改一处 / 多处受益）
+
+#### R1 · 裁剪逻辑重复 3 份、同一 bug 重复 3 次  🟡 部分修复（2026-07-04：资源安全）
+
+**位置**：[`rl/video_event_plugin.py:132-169`](video_event_plugin.py:132) `_crop_event`
+· [`eval/utils.py:200-264`](../eval/utils.py:200) `_crop_video`
+· [`scripts/convert_annotations.py:124-169`](../scripts/convert_annotations.py:124) `crop_event_clip`
+
+**共性 bug**：① `cv2.VideoWriter`/`VideoCapture` 无 `try/finally` → 异常时泄漏句柄 + 留孤儿 mp4；
+② cv2 `CAP_PROP_POS_FRAMES` seek 到最近关键帧、**起点可偏移数百 ms** → 裁出片段与事件时间窗错位，
+模型看错内容却不报错（decord 已是依赖且帧精确）。
+
+**修法**：抽成一个共享 `crop_clip()`（decord 帧精确 + `try/finally` + 失败清理），三处共用；
+顺带消除 train/eval 裁剪不一致风险。
+
+> **已修（资源安全部分，2026-07-04）**：3 处裁剪函数就地加 `try/finally` 保证 `cap`/`out`
+> 句柄释放，异常/无效产物时删除孤儿 mp4。**未做**：decord 帧精确改造 + 抽共享模块
+> （经确认会改变裁片结果、影响可复现性，且跨包 import 改造有风险，留作独立重构）。
+> ⚠️ **cv2 seek 不精确问题仍存在**（起点可偏移数百 ms），后续如需帧精确再单独处理。
+
+#### R2 · 关键帧缓存无版本护栏（训练 + 评估同根）
+
+**位置**：[`scripts/convert_annotations_d.py:87-130`](../scripts/convert_annotations_d.py:87)
+· [`eval/utils.py:380-421`](../eval/utils.py:380)
+
+**问题**：缓存文件名仅 `event_{id}_kf_{i}.jpg`，只判存在就复用，**不含 scene_metadata 版本**。
+`scene_metadata.json` 一旦重新分割事件，旧帧被静默复用、与新事件时间窗错位——**训练和评估同时中招**。
+J 的 caption 已有 `_meta.scene_metadata_sha1` 一致性校验（[`eval/utils.py:317-326`](../eval/utils.py:317)），关键帧却没有。
+
+**修法**：关键帧目录/文件名嵌入 scene_metadata 的 sha1（与 J caption 护栏对齐），训练侧与评估侧共用同一命名。
+
+#### R3 · `"cropped_video"` 字符串启发式脆弱（多文件重复）
+
+**位置**：[`scripts/convert_annotations.py:228,244,294`](../scripts/convert_annotations.py:228)
+· [`scripts/convert_annotations_d.py:76-84`](../scripts/convert_annotations_d.py:76) `_split_videos`
+
+**问题**：靠 `"cropped_video" in path` 区分主视频与 tool 片段。若主视频路径恰含该子串 →
+被误分类 → 样本静默降级/丢弃。**修法**：改用显式 clip 命名前缀或元数据标记，抽成一处共享判定。
+
+#### R4 · 空覆盖 / 越界的静默兜底（方向相反的两种错误）  ✅ 已修复（2026-07-03）
+
+**位置**：[`scripts/convert_annotations.py:252`](../scripts/convert_annotations.py:252)
+（轮级：`or [events[0]]` **伪造 event 0** 监督）
+· [`scripts/convert_annotations.py:279-282,303-306`](../scripts/convert_annotations.py:279)
+（样本级：空 `covering_event_ids` **保留空**，成永久 0 奖励/0 目标噪声）
+
+**问题**：timestamp 未覆盖任何事件时，轮级 tool_call 兜底改写成"看 event 0"（注入错误监督），
+样本级 covering 却保留空集（下游 `Event_Reward`/grounding F1 恒 0，纯梯度噪声）。两者都应改为
+**丢弃 + 统计占比**，而非静默兜底。
+
+> **实际修法（比原计划更精确，避免误伤 qa 样本）**：
+> ① 删除 `or [events[0]]` 伪造 —— 退化 tool_call 直接丢样本(`tool_empty_cover`)；
+> ② 空覆盖集按 `data_type` 区分：**grounding**(答案即定位,acc+event 恒 0)丢弃，
+> **qa**(acc 仍有效)保留+告警，不再一刀切丢；
+> ③ 顺带修 reward 交互 bug —— `gt_covering_event_ids` 仅在非空时写入，否则空列表会因
+> `traj.get('gt_covering_event_ids', covering_event_ids)` 的"按键存在取值"语义
+> **shadow 掉有效的 covering_event_ids**（[`video_event_plugin.py:417`](video_event_plugin.py:417)）；
+> ④ 新增 4 个诊断计数并入汇总行。见 [`convert_annotations.py:252,288,318`](../scripts/convert_annotations.py:252)。
+
+### 🟠 中危 / 观察项
+
+| ID | 标题 | 位置 |
+|----|------|------|
+| T4 | 插件硬编码 `FPS_MAX_FRAMES=64` 不读 env，与脚本 `FPS_MAX_FRAMES=512` 割裂（调脚本对插件裁片无效）| [`video_event_plugin.py:39`](video_event_plugin.py:39) vs [`grpo_events.sh:87`](grpo_events.sh:87) |
+| T5 | reward 权重 `tool_penalty=1.0` = 2× `event_reward=0.5`，惩罚项压过核心定位信号 | [`grpo_events.sh`](grpo_events.sh) `--reward_weights` |
+| T6 | 主视频选取 SFT（跳过 cropped_video）与 RL（直接 videos[0]）不一致 | [`convert_annotations.py:228`](../scripts/convert_annotations.py:228) vs `:294` |
+| T7 | H4 清理只在 `__init__` 跑一次，长单次训练（>清理阈值）磁盘仍会涨 | [`video_event_plugin.py:88-90`](video_event_plugin.py:88) |
+| T8 | `chosen = [...][:5]` 静默截断，模型选 >5 个事件时无日志 | [`video_event_plugin.py:322`](video_event_plugin.py:322) |
+| T9 | `user_prompt.split("<image 1>")` 对多图/零图 benchmark（Video-MMMU）会 `ValueError` | [`eval/utils.py:446,600`](../eval/utils.py:446) |
+
+### 建议修复顺序
+
+1. **先验证再修 T1**（可能让此前所有评估结论无效，成本最低、影响最大）
+2. **R4 + T2**（数据质量：错误/空监督直接污染训练集）
+3. **T3**（配置：削弱 D/J 方案本身的价值，改一行 + 一次对比实验）
+4. **R1 + R2 + R3**（重构收敛：一次抽取共享工具，消除 3~4 处重复隐患）
+5. **T4~T9**（调参与健壮性观察项，可随手带上）
